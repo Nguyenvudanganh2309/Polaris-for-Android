@@ -26,7 +26,7 @@ matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.patches import Circle
-from matplotlib.collections import PatchCollection
+from matplotlib.collections import PatchCollection, PolyCollection
 from matplotlib.widgets import TextBox, Button
 import numpy as np
 
@@ -44,12 +44,13 @@ def parse_fabmaster(filepath: str) -> dict:
     PAD_HEADER  = "A!PAD_NAME!REC_NUMBER!LAYER!FIXFLAG!VIAFLAG!PADSHAPE1!PADWIDTH!PADHGHT"
     PIN_HEADER  = "A!SYM_NAME!PIN_NAME!PIN_NUMBER!PIN_X!PIN_Y!PAD_STACK_NAME!REFDES"
 
-    components: dict = {}
-    netlist          = defaultdict(list)
-    comp_nets        = defaultdict(list)
-    outline: list    = []
-    pad_sizes: dict  = {}   # pad_stack_name -> diameter (mm)
-    tp_pad_map: dict = {}   # refdes -> pad_stack_name
+    components: dict  = {}
+    netlist           = defaultdict(list)
+    comp_nets         = defaultdict(list)
+    outline: list     = []
+    pad_sizes: dict   = {}   # pad_stack_name -> diameter (mm)
+    tp_pad_map: dict  = {}   # refdes -> pad_stack_name
+    comp_pin_xy: dict = defaultdict(list)  # refdes -> [(pin_x, pin_y), ...]
     mode = None
 
     for line in lines:
@@ -100,6 +101,10 @@ def parse_fabmaster(filepath: str) -> dict:
             pad_stack = parts[6]; refdes = parts[7]
             if refdes and pad_stack:
                 tp_pad_map[refdes] = pad_stack
+            try:
+                comp_pin_xy[refdes].append((float(parts[4]), float(parts[5])))
+            except (ValueError, IndexError):
+                pass
 
         elif (len(parts) > 2 and parts[1] == 'BOARD GEOMETRY'
               and parts[2] == 'DESIGN_OUTLINE'):
@@ -119,9 +124,22 @@ def parse_fabmaster(filepath: str) -> dict:
             except ValueError:
                 pass
 
+    # Bounding box of each component from its absolute pin positions
+    PAD = 0.35   # mm margin around pin extents
+    comp_bounds: dict = {}
+    for refdes, pts in comp_pin_xy.items():
+        if not pts:
+            continue
+        xs_p = [p[0] for p in pts]; ys_p = [p[1] for p in pts]
+        comp_bounds[refdes] = dict(
+            xmin=min(xs_p) - PAD, xmax=max(xs_p) + PAD,
+            ymin=min(ys_p) - PAD, ymax=max(ys_p) + PAD,
+        )
+
     return dict(components=components, netlist=netlist,
                 comp_nets=comp_nets, outline=outline,
-                pad_sizes=pad_sizes, tp_pad_map=tp_pad_map)
+                pad_sizes=pad_sizes, tp_pad_map=tp_pad_map,
+                comp_bounds=comp_bounds)
 
 
 # ─── Geometry ─────────────────────────────────────────────────────────────────
@@ -236,6 +254,62 @@ def detect_and_parse(filepath: str) -> dict:
     )
 
 
+# ─── Component size heuristic ────────────────────────────────────────────────
+
+def _comp_size(comp: dict) -> tuple:
+    """Return (width_mm, height_mm) for a component rectangle.
+
+    Tries to extract size from sym_name (e.g. '0402', '0805', 'SOIC8'),
+    then falls back to comp_class / refdes prefix.
+    """
+    sym = comp.get('sym_name', '').upper()
+    cls = comp.get('comp_class', '').upper()
+    ref = comp.get('refdes', '').upper()
+
+    # Imperial passive codes  w    h
+    for code, wh in [('2010', (5.0, 2.5)),
+                     ('1812', (4.5, 3.2)),
+                     ('1210', (3.2, 2.5)),
+                     ('1206', (3.2, 1.6)),
+                     ('0805', (2.0, 1.2)),
+                     ('0603', (1.6, 0.8)),
+                     ('0402', (1.0, 0.5)),
+                     ('0201', (0.6, 0.3))]:
+        if code in sym:
+            return wh
+
+    # SOT / SOD / QFN / BGA size hints
+    for kw, wh in [('BGA',  (12.0, 12.0)),
+                   ('QFN',  ( 7.0,  7.0)),
+                   ('QFP',  (14.0, 14.0)),
+                   ('SOIC', ( 5.0,  4.0)),
+                   ('SOP',  ( 5.0,  4.0)),
+                   ('SOT',  ( 3.0,  2.0)),
+                   ('SOD',  ( 2.7,  1.4)),
+                   ('DIP',  ( 8.0,  2.5))]:
+        if kw in sym:
+            return wh
+
+    # Class / refdes prefix defaults
+    if cls == 'IC'         or ref[:1] == 'U': return (8.0, 8.0)
+    if cls == 'CONNECTOR'  or ref[:1] in ('J', 'P'): return (6.0, 3.5)
+    if cls == 'INDUCTOR'   or ref[:1] == 'L': return (3.0, 2.5)
+    if cls == 'TRANSISTOR' or ref[:1] == 'Q': return (2.5, 2.0)
+    if cls == 'DIODE'      or ref[:1] == 'D': return (2.5, 1.4)
+    if cls in ('RESISTOR', 'CAPACITOR') or ref[:1] in ('R', 'C'): return (1.6, 0.8)
+    return (3.0, 2.0)
+
+
+def _rotated_box(cx, cy, w, h, angle_deg):
+    """Return list of 4 (x, y) corner points for a rotated rectangle."""
+    a   = math.radians(angle_deg)
+    cos_a, sin_a = math.cos(a), math.sin(a)
+    hw, hh = w / 2, h / 2
+    corners = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)]
+    return [(cx + x * cos_a - y * sin_a,
+             cy + x * sin_a + y * cos_a) for x, y in corners]
+
+
 # ─── PCB Viewer ───────────────────────────────────────────────────────────────
 
 class PCBViewer:
@@ -266,36 +340,43 @@ class PCBViewer:
         self.ax_info.axis('off')
 
         # ── widgets ──────────────────────────────────────────────────────
-        ax_open = self.fig.add_axes([0.005, 0.952, 0.13, 0.038])
+        ax_open   = self.fig.add_axes([0.005, 0.952, 0.13,  0.038])
+        ax_top    = self.fig.add_axes([0.145, 0.952, 0.075, 0.038])
+        ax_bottom = self.fig.add_axes([0.230, 0.952, 0.085, 0.038])
         ax_tb   = self.fig.add_axes([0.005, 0.020, 0.42, 0.066])
         ax_btn  = self.fig.add_axes([0.430, 0.020, 0.09, 0.066])
         ax_clr  = self.fig.add_axes([0.526, 0.020, 0.07, 0.066])
 
         self.textbox = TextBox(ax_tb, 'Search: ', initial='',
-                               color='#181828', hovercolor='#22223A',
+                               color="#E5E5F1", hovercolor="#E8E8F3",
                                label_pad=0.04)
-        self.textbox.label.set_color('#8899BB')
-        self.textbox.text_disp.set_color('#FFDD57')
+        self.textbox.label.set_color("#2F3646")
+        self.textbox.text_disp.set_color("#050402")
         self.textbox.text_disp.set_fontsize(10)
 
-        self.btn_find  = Button(ax_btn,  'Find',      color='#0F3460', hovercolor='#1E5C9E')
-        self.btn_clear = Button(ax_clr,  'Clear',     color='#2A2A50', hovercolor='#44447A')
-        self.btn_open  = Button(ax_open, 'Open File', color='#1A3A1A', hovercolor='#2A5A2A')
-        for b in (self.btn_find, self.btn_clear, self.btn_open):
+        self.btn_find   = Button(ax_btn,    'Find',      color='#0F3460', hovercolor='#1E5C9E')
+        self.btn_clear  = Button(ax_clr,    'Clear',     color='#2A2A50', hovercolor='#44447A')
+        self.btn_open   = Button(ax_open,   'Open File', color='#1A3A1A', hovercolor='#2A5A2A')
+        self.btn_top    = Button(ax_top,    'TOP',       color='#1A2A3A', hovercolor='#2A4A6A')
+        self.btn_bottom = Button(ax_bottom, 'BOTTOM',    color='#2A1A3A', hovercolor='#4A2A6A')
+        for b in (self.btn_find, self.btn_clear, self.btn_open,
+                  self.btn_top, self.btn_bottom):
             b.label.set_color('white'); b.label.set_fontsize(9)
 
         self.btn_find.on_clicked(self._on_search)
         self.btn_clear.on_clicked(self._on_clear)
         self.btn_open.on_clicked(self._on_open_file)
+        self.btn_top.on_clicked(self._on_top_view)
+        self.btn_bottom.on_clicked(self._on_bottom_view)
         self.textbox.on_submit(self._on_search)
 
         # ── panel filter textbox (right side, below info panel) ──────────
         ax_filter = self.fig.add_axes([0.645, 0.020, 0.305, 0.066])
         self.filter_box = TextBox(ax_filter, 'Filter: ', initial='',
-                                  color='#0E1A14', hovercolor='#162010',
+                                  color="#F4F7F5", hovercolor="#F7F9F6",
                                   label_pad=0.04)
-        self.filter_box.label.set_color('#6ABB8A')
-        self.filter_box.text_disp.set_color('#AAFFCC')
+        self.filter_box.label.set_color("#2AD3AB")
+        self.filter_box.text_disp.set_color("#000000")
         self.filter_box.text_disp.set_fontsize(9)
         self.filter_box.on_submit(self._on_filter)
 
@@ -312,6 +393,12 @@ class PCBViewer:
         self._panel_filter       = ''    # current filter string
         self._info_mode          = 'idle'  # 'idle' | 'comp' | 'net' | 'tp'
         self._info_net_query     = ''
+        self._view_mode          = 'top'   # 'top' | 'bottom'
+        self._top_data           = data    # original/top-side data
+        self._bottom_data        = None    # loaded lazily from map/
+        self._tp_collection      = None
+        self._bottom_comps       = []
+        self._comp_labels        = []
 
         # ── draw ─────────────────────────────────────────────────────────
         self._draw_board()
@@ -406,10 +493,70 @@ class PCBViewer:
         self.fig.canvas.manager.set_window_title(title)
         self.ax.set_title(title, color='#B0C4D8', fontsize=10, pad=5)
 
+        self._top_data = data   # track most-recently opened file as top data
+        self._view_mode = 'top'
         self._show_idle_info()
         self.fig.canvas.draw_idle()
         print(f"Loaded: {filepath}")
         print(f"  Components: {n_c}  TPs: {n_tp}  Nets: {n_n}")
+
+    # ─── TOP / BOTTOM view toggle ──────────────────────────────────────────
+
+    def _on_top_view(self, _=None):
+        """Switch to TOP view: current board data with TPs and PPs."""
+        if self._view_mode == 'top':
+            return
+        self._view_mode = 'top'
+        self._switch_data(self._top_data)
+
+    def _on_bottom_view(self, _=None):
+        """Switch to BOTTOM view: components from map/ folder file."""
+        if self._view_mode == 'bottom':
+            return
+        self._view_mode = 'bottom'
+        if self._bottom_data is None:
+            map_dir = Path(__file__).parent / 'map'
+            candidates = sorted(map_dir.glob('*.txt')) + sorted(map_dir.glob('*.fab'))
+            if not candidates:
+                self._show_info_error("No file found in map/ folder")
+                self.fig.canvas.draw_idle()
+                self._view_mode = 'top'
+                return
+            try:
+                self._bottom_data = detect_and_parse(str(candidates[0]))
+                print(f"BOTTOM data loaded: {candidates[0]}")
+            except Exception as e:
+                self._show_info_error(str(e))
+                self.fig.canvas.draw_idle()
+                self._view_mode = 'top'
+                return
+        self._switch_data(self._bottom_data)
+
+    def _switch_data(self, data: dict):
+        """Rebuild indices and redraw the board with the given data dict."""
+        self.data         = data
+        self._pad_sizes   = data.get('pad_sizes', {})
+        self._tp_pad_map  = data.get('tp_pad_map', {})
+        self._testpoints  = {}
+        self._tp_net      = {}
+        self._tp_all_nets = {}
+        self._comp_to_tps = defaultdict(lambda: defaultdict(list))
+        self._tp_order    = []
+        self._build_indices()
+        self._clear_highlights()
+        self.ax.cla()
+        self._tp_collection = None   # cla() removed it from axes; reset reference
+        self.ax.set_facecolor('#0A1018')
+        self._draw_board()
+        if self._view_mode == 'bottom':
+            self._draw_components_bottom()
+        else:
+            self._draw_components()
+            self._draw_testpoints()
+        self._auto_zoom()
+        self._draw_legend()
+        self._show_idle_info()
+        self.fig.canvas.draw_idle()
 
     def _show_info_error(self, msg: str):
         self._clear_info()
@@ -475,6 +622,77 @@ class PCBViewer:
             self.ax.scatter(xs, ys, s=5, color='#2E3E50', marker='s',
                             alpha=0.6, zorder=2, linewidths=0)
 
+    _COMP_COLORS = {
+        'IC':         '#FFD700',
+        'RESISTOR':   '#4FC3F7',
+        'CAPACITOR':  '#81C784',
+        'CONNECTOR':  '#FF8A65',
+        'INDUCTOR':   '#CE93D8',
+        'TRANSISTOR': '#F48FB1',
+        'DIODE':      '#80DEEA',
+    }
+    _COMP_COLOR_DEFAULT = '#B0BEC5'
+
+    def _draw_components_bottom(self):
+        """Draw each non-TP component as a rectangle sized from actual pin bounds."""
+        comps = [(r, c) for r, c in self.data['components'].items()
+                 if not is_testpoint(c)]
+        if not comps:
+            return
+
+        self._bottom_comps = comps   # cache for label refresh
+        bounds = self.data.get('comp_bounds', {})
+
+        verts  = []
+        colors = []
+        for refdes, c in comps:
+            b = bounds.get(refdes)
+            if b and (b['xmax'] - b['xmin']) > 0.05 and (b['ymax'] - b['ymin']) > 0.05:
+                # Use actual axis-aligned bounding box from pin positions
+                verts.append([(b['xmin'], b['ymin']), (b['xmax'], b['ymin']),
+                               (b['xmax'], b['ymax']), (b['xmin'], b['ymax'])])
+            else:
+                # Fallback: heuristic rotated rectangle
+                w, h = _comp_size(c)
+                verts.append(_rotated_box(c['x'], c['y'], w, h, c.get('rotate', 0)))
+            colors.append(self._COMP_COLORS.get(
+                c.get('comp_class', '').upper(), self._COMP_COLOR_DEFAULT))
+
+        col = PolyCollection(verts, facecolors=colors, edgecolors='#444444',
+                             linewidths=0.5, alpha=0.80, zorder=4, clip_on=True)
+        self.ax.add_collection(col)
+        self._comp_labels = []   # labels drawn lazily on zoom
+
+    def _refresh_bottom_labels(self):
+        """Show refdes labels only for components visible in the current viewport.
+        Called after every zoom/pan in BOTTOM mode."""
+        for t in getattr(self, '_comp_labels', []):
+            try: t.remove()
+            except Exception: pass
+        self._comp_labels = []
+
+        comps = getattr(self, '_bottom_comps', [])
+        if not comps:
+            return
+
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+        visible = [(r, c) for r, c in comps
+                   if xlim[0] <= c['x'] <= xlim[1] and ylim[0] <= c['y'] <= ylim[1]]
+
+        # Only render labels when few enough components are in view
+        if len(visible) > 80:
+            return
+
+        for refdes, c in visible:
+            t = self.ax.text(
+                c['x'], c['y'], refdes,
+                fontsize=7, color='white', ha='center', va='center',
+                fontweight='bold', zorder=6, clip_on=True,
+                bbox=dict(boxstyle='round,pad=0.15', facecolor='#000000',
+                          alpha=0.55, edgecolor='none'))
+            self._comp_labels.append(t)
+
     def _draw_testpoints(self):
         patches, fc, ec = [], [], []
         for refdes, c in self._tp_order:
@@ -487,19 +705,39 @@ class PCBViewer:
         self.ax.add_collection(self._tp_collection)
 
     def _auto_zoom(self):
-        xs = [c['x'] for c in self.data['components'].values()]
-        ys = [c['y'] for c in self.data['components'].values()]
+        """Fit the view to the board outline (SIP edges) so both views share the same frame."""
+        xs, ys = [], []
+        for seg in self.data.get('outline', []):
+            xs += [seg['x1'], seg['x2']]
+            ys += [seg['y1'], seg['y2']]
+        if not xs:                          # fallback: use component positions
+            xs = [c['x'] for c in self.data['components'].values()]
+            ys = [c['y'] for c in self.data['components'].values()]
         if not xs: return
-        pad = max(max(xs)-min(xs), max(ys)-min(ys)) * 0.05 + 1.0
-        self.ax.set_xlim(min(xs)-pad, max(xs)+pad)
-        self.ax.set_ylim(min(ys)-pad, max(ys)+pad)
+        w   = max(xs) - min(xs)
+        h   = max(ys) - min(ys)
+        pad = max(w, h) * 0.04 + 1.0
+        self.ax.set_xlim(min(xs) - pad, max(xs) + pad)
+        self.ax.set_ylim(min(ys) - pad, max(ys) + pad)
 
     def _draw_legend(self):
-        handles = [
-            mpatches.Patch(color='#00CFFF', label='TP / TPA – test point'),
-            mpatches.Patch(color='#FF9F43', label='PPA / PP – power probe'),
-            mpatches.Patch(color='#2E3E50', label='Component'),
-        ]
+        if self._view_mode == 'bottom':
+            handles = [
+                mpatches.Patch(color='#FFD700', label='IC'),
+                mpatches.Patch(color='#4FC3F7', label='Resistor'),
+                mpatches.Patch(color='#81C784', label='Capacitor'),
+                mpatches.Patch(color='#FF8A65', label='Connector'),
+                mpatches.Patch(color='#CE93D8', label='Inductor'),
+                mpatches.Patch(color='#F48FB1', label='Transistor'),
+                mpatches.Patch(color='#80DEEA', label='Diode'),
+                mpatches.Patch(color='#B0BEC5', label='Other'),
+            ]
+        else:
+            handles = [
+                mpatches.Patch(color='#00CFFF', label='TP / TPA – test point'),
+                mpatches.Patch(color='#FF9F43', label='PPA / PP – power probe'),
+                mpatches.Patch(color='#2E3E50', label='Component'),
+            ]
         self.ax.legend(handles=handles, loc='upper right',
                        fontsize=7, framealpha=0.35,
                        labelcolor='white', facecolor='#0A1018',
@@ -536,6 +774,8 @@ class PCBViewer:
             ylim = self.ax.get_ylim()
             self.ax.set_xlim([xdata + (x - xdata) * factor for x in xlim])
             self.ax.set_ylim([ydata + (y - ydata) * factor for y in ylim])
+            if self._view_mode == 'bottom':
+                self._refresh_bottom_labels()
             self.fig.canvas.draw_idle()
 
         elif event.inaxes == self.ax_info:
@@ -601,6 +841,10 @@ class PCBViewer:
     # ── click on PCB board ────────────────────────────────────────────────
 
     def _handle_board_click(self, event):
+        if self._view_mode == 'bottom':
+            self._handle_bottom_click(event)
+            return
+
         TOL = max(self._r(c) * 3.0 for _, c in self._tp_order) if self._tp_order else 1.0
         best_dist, best_r = TOL, None
         for refdes, c in self._tp_order:
@@ -614,6 +858,74 @@ class PCBViewer:
         else:
             self._remove_board_annot()
             self.fig.canvas.draw_idle()
+
+    def _handle_bottom_click(self, event):
+        """Click handler for BOTTOM view — find component rect, show info."""
+        mx, my = event.xdata, event.ydata
+        bounds = self.data.get('comp_bounds', {})
+        comps  = {r: c for r, c in self.data['components'].items()
+                  if not is_testpoint(c)}
+
+        # Priority 1: smallest bounding box that contains the click point
+        best, best_area = None, float('inf')
+        for refdes, b in bounds.items():
+            if refdes not in comps: continue
+            if b['xmin'] <= mx <= b['xmax'] and b['ymin'] <= my <= b['ymax']:
+                area = (b['xmax'] - b['xmin']) * (b['ymax'] - b['ymin'])
+                if area < best_area:
+                    best_area, best = area, refdes
+
+        # Priority 2: nearest component centre within tolerance
+        if best is None:
+            xlim = self.ax.get_xlim()
+            tol  = (xlim[1] - xlim[0]) * 0.015   # 1.5% of viewport width
+            best_d = tol
+            for refdes, c in comps.items():
+                d = math.hypot(c['x'] - mx, c['y'] - my)
+                if d < best_d:
+                    best_d, best = d, refdes
+
+        if best:
+            self._highlight_bottom_comp(best)
+            self._show_info_comp(best, comps[best], {})
+            self.fig.canvas.draw_idle()
+        else:
+            self._clear_highlights()
+            self._show_idle_info()
+            self.fig.canvas.draw_idle()
+
+    def _highlight_bottom_comp(self, refdes: str):
+        """Draw a red selection border + label over the clicked component."""
+        self._clear_highlights()
+        bounds = self.data.get('comp_bounds', {})
+        comp   = self.data['components'].get(refdes)
+        if not comp: return
+
+        b = bounds.get(refdes)
+        if b and (b['xmax'] - b['xmin']) > 0.05:
+            x0, y0 = b['xmin'], b['ymin']
+            w,  h  = b['xmax'] - b['xmin'], b['ymax'] - b['ymin']
+            label_x = (b['xmin'] + b['xmax']) / 2
+            label_y = b['ymax']
+        else:
+            w, h   = _comp_size(comp)
+            x0, y0 = comp['x'] - w / 2, comp['y'] - h / 2
+            label_x, label_y = comp['x'], comp['y'] + h / 2
+
+        border = mpatches.Rectangle(
+            (x0, y0), w, h,
+            fill=False, edgecolor='#FF3333', linewidth=2.2,
+            zorder=10, linestyle='--')
+        self.ax.add_patch(border)
+        self._highlights.append(border)
+
+        lbl = self.ax.text(
+            label_x, label_y + 0.25, refdes,
+            color='#FFEE88', fontsize=8, ha='center', va='bottom',
+            fontweight='bold', zorder=11, clip_on=True,
+            bbox=dict(boxstyle='round,pad=0.2', facecolor='#0A1018',
+                      edgecolor='#FFDD57', linewidth=1.0, alpha=0.92))
+        self._highlights.append(lbl)
 
     # ── click on info panel row ───────────────────────────────────────────
 
@@ -948,9 +1260,10 @@ class PCBViewer:
         ax.text(C1, y, col_hdr, transform=FM, color='#90CDF4',
                 fontsize=6.8, va='top', fontweight='bold',
                 fontfamily='monospace')
-        ax.text(C2, y, "TEST POINT", transform=FM, color='#90CDF4',
-                fontsize=6.8, va='top', fontweight='bold',
-                fontfamily='monospace')
+        if self._view_mode != 'bottom':
+            ax.text(C2, y, "TEST POINT", transform=FM, color='#90CDF4',
+                    fontsize=6.8, va='top', fontweight='bold',
+                    fontfamily='monospace')
         y -= DY * 0.8
         ax.plot([0,1],[y,y], color='#253545', lw=0.5, transform=FM)
         y -= DY * 0.3
