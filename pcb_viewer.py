@@ -259,17 +259,17 @@ class PCBViewer:
         self.fig = plt.figure(figsize=(17, 10), facecolor='#111118')
         self.fig.canvas.manager.set_window_title(title)
 
-        self.ax = self.fig.add_axes([0.005, 0.11, 0.625, 0.875],
+        self.ax = self.fig.add_axes([0.005, 0.11, 0.625, 0.835],
                                     facecolor='#0A1018')
         self.ax_info = self.fig.add_axes([0.645, 0.11, 0.35, 0.875],
                                          facecolor='#0A1018')
         self.ax_info.axis('off')
 
         # ── widgets ──────────────────────────────────────────────────────
-        ax_tb   = self.fig.add_axes([0.005, 0.020, 0.36, 0.066])
-        ax_btn  = self.fig.add_axes([0.372, 0.020, 0.09, 0.066])
-        ax_clr  = self.fig.add_axes([0.468, 0.020, 0.07, 0.066])
-        ax_open = self.fig.add_axes([0.545, 0.020, 0.10, 0.066])
+        ax_open = self.fig.add_axes([0.005, 0.952, 0.13, 0.038])
+        ax_tb   = self.fig.add_axes([0.005, 0.020, 0.42, 0.066])
+        ax_btn  = self.fig.add_axes([0.430, 0.020, 0.09, 0.066])
+        ax_clr  = self.fig.add_axes([0.526, 0.020, 0.07, 0.066])
 
         self.textbox = TextBox(ax_tb, 'Search: ', initial='',
                                color='#181828', hovercolor='#22223A',
@@ -310,6 +310,8 @@ class PCBViewer:
         self._info_visible       = 30
         self._current_comp       = None
         self._panel_filter       = ''    # current filter string
+        self._info_mode          = 'idle'  # 'idle' | 'comp' | 'net' | 'tp'
+        self._info_net_query     = ''
 
         # ── draw ─────────────────────────────────────────────────────────
         self._draw_board()
@@ -654,8 +656,10 @@ class PCBViewer:
         self._remove_board_annot()
         self._info_rows.clear()
         self._all_info_rows.clear()
-        self._info_scroll  = 0
-        self._current_comp = None
+        self._info_scroll    = 0
+        self._current_comp   = None
+        self._info_mode      = 'idle'
+        self._info_net_query = ''
 
     def _on_clear(self, _=None):
         self.textbox.set_val('')
@@ -705,15 +709,13 @@ class PCBViewer:
                             seen.add(r)
                             matches.append(r)
 
-        # 4. Net / signal name — find components on that net
+        # 4. Net / signal name — signal-centric panel
         if not matches:
             found_nets = [n for n in netlist if query in n.upper()]
-            seen = set()
-            for net in found_nets:
-                for r, _, _ in netlist.get(net, []):
-                    if r not in seen and r in comps and not is_testpoint(comps[r]):
-                        seen.add(r)
-                        matches.append(r)
+            if found_nets:
+                self._show_info_nets(query, found_nets)
+                self.fig.canvas.draw_idle()
+                return
 
         if not matches:
             self._show_info_none(query)
@@ -893,20 +895,27 @@ class PCBViewer:
         # ── fixed header (always visible) ─────────────────────────────────
         HEADER_H = 0.175    # fraction of axes height used by header
         y = 0.985
-        ax.text(0.03, y, refdes, transform=FM, color='#FFDD57',
-                fontsize=11, va='top', fontweight='bold',
-                fontfamily='monospace')
-        y -= 0.032
-        ax.text(0.03, y,
-                f"Class: {comp['comp_class']}   Value: {comp['value']}",
-                transform=FM, color='#6A7E94', fontsize=7, va='top',
-                fontfamily='monospace')
-        y -= 0.020
-        ax.text(0.03, y,
-                f"Pos: ({comp['x']:.3f}, {comp['y']:.3f}) mm",
-                transform=FM, color='#6A7E94', fontsize=7, va='top',
-                fontfamily='monospace')
-        y -= 0.015
+        info_mode = getattr(self, '_info_mode', 'comp')
+        if info_mode == 'net':
+            ax.text(0.03, y, f'Signal: "{self._info_net_query}"',
+                    transform=FM, color='#AAFFCC', fontsize=10, va='top',
+                    fontweight='bold', fontfamily='monospace')
+            y -= 0.044
+        else:
+            ax.text(0.03, y, refdes, transform=FM, color='#FFDD57',
+                    fontsize=11, va='top', fontweight='bold',
+                    fontfamily='monospace')
+            y -= 0.032
+            ax.text(0.03, y,
+                    f"Class: {comp['comp_class']}   Value: {comp['value']}",
+                    transform=FM, color='#6A7E94', fontsize=7, va='top',
+                    fontfamily='monospace')
+            y -= 0.020
+            ax.text(0.03, y,
+                    f"Pos: ({comp['x']:.3f}, {comp['y']:.3f}) mm",
+                    transform=FM, color='#6A7E94', fontsize=7, va='top',
+                    fontfamily='monospace')
+            y -= 0.015
         ax.plot([0,1],[y,y], color='#1E2A3A', lw=0.7, transform=FM)
         y -= 0.010
 
@@ -935,7 +944,8 @@ class PCBViewer:
         # Column header
         C1, C2 = 0.02, 0.58
         DY     = 0.0235
-        ax.text(C1, y, "PIN   SIGNAL", transform=FM, color='#90CDF4',
+        col_hdr = "SIGNAL" if info_mode == 'net' else "PIN   SIGNAL"
+        ax.text(C1, y, col_hdr, transform=FM, color='#90CDF4',
                 fontsize=6.8, va='top', fontweight='bold',
                 fontfamily='monospace')
         ax.text(C2, y, "TEST POINT", transform=FM, color='#90CDF4',
@@ -990,7 +1000,8 @@ class PCBViewer:
             sig_col = '#9AE6B4' if has_tp else '#5A7A8A'
             net_str = net if len(net) <= 26 else net[:25] + '\u2026'
 
-            ax.text(C1, y, f"p{pin_n:<4} {net_str}",
+            row_label = net_str if info_mode == 'net' else f"p{pin_n:<4} {net_str}"
+            ax.text(C1, y, row_label,
                     transform=FM, color=sig_col, fontsize=6.2, va='top',
                     fontfamily='monospace', clip_on=True)
 
@@ -1030,6 +1041,58 @@ class PCBViewer:
                     f"rows {start+1}–{end} of {total}",
                     transform=FM, color='#3A5060', fontsize=6,
                     ha='center', va='bottom', fontfamily='monospace')
+
+    def _show_info_nets(self, query: str, nets: list):
+        """Signal-centric panel: list all nets matching query with their TPs."""
+        self._clear_info()
+        self._info_mode      = 'net'
+        self._info_net_query = query
+
+        comp_nets = self.data['comp_nets']
+        tp_by_net: dict = defaultdict(list)
+        for r in self._testpoints:
+            for net, _, _ in comp_nets.get(r, []):
+                tp_by_net[net].append(r)
+
+        rows = []
+        all_tp_refdes = set()
+        for net in nets:
+            if is_gnd_net(net):
+                continue
+            tps = tp_by_net.get(net, [])
+            tp_r = tps[0] if tps else None
+            if tp_r:
+                all_tp_refdes.add(tp_r)
+            rows.append((net, '', '', tp_r))
+
+        def _sort_key(row):
+            tp_r = row[3]
+            if tp_r is None: return (2, row[0])
+            r = tp_r.upper()
+            if r.startswith('TPA') or r.startswith('TP'): return (0, row[0])
+            return (1, row[0])
+        rows.sort(key=_sort_key)
+
+        self._all_info_rows    = rows
+        self._info_scroll      = 0
+        self._info_comp_refdes = f'NET:{query}'
+        self._info_comp        = {'comp_class': '', 'value': '', 'x': 0, 'y': 0}
+
+        # Highlight all matching TPs on board
+        if all_tp_refdes:
+            ring_patches = []
+            for tp_r in all_tp_refdes:
+                tp = self._testpoints.get(tp_r)
+                if not tp: continue
+                ring_patches.append(
+                    Circle((tp['x'], tp['y']), self._r(tp) * self._RING_MULT))
+            self._ring_collection = PatchCollection(
+                ring_patches, facecolors='none',
+                edgecolors='#FF2222', linewidths=2.2,
+                zorder=8, alpha=1.0)
+            self.ax.add_collection(self._ring_collection)
+
+        self._redraw_info_table()
 
     def _show_idle_info(self):
         self._clear_info()
