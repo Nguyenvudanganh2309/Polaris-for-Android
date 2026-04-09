@@ -640,7 +640,7 @@ class PCBViewer:
                             alpha=0.6, zorder=2, linewidths=0)
 
     _COMP_COLORS = {
-        'IC':         '#FFD700',
+        'IC':         "#976421",
         'RESISTOR':   '#4FC3F7',
         'CAPACITOR':  '#81C784',
         'CONNECTOR':  '#FF8A65',
