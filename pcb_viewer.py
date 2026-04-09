@@ -422,8 +422,8 @@ class PCBViewer:
         self._info_mode          = 'idle'  # 'idle' | 'comp' | 'net' | 'tp'
         self._info_net_query     = ''
         self._view_mode          = 'top'   # 'top' | 'bottom'
-        self._top_data           = data    # original/top-side data
-        self._bottom_data        = None    # loaded lazily from map/
+        self._project_data       = data    # the one loaded file — used for both views
+        self._project_dir        = str(Path(data.get('_filepath', __file__)).parent)
         self._tp_collection      = None
         self._pin_collection     = None
         self._bottom_comps       = []
@@ -464,8 +464,7 @@ class PCBViewer:
                 ("Fabmaster / text", "*.txt *.fab *.asc"),
                 ("All files",        "*.*"),
             ],
-            initialdir=str(Path(self.data.get('_filepath',
-                                __file__)).parent),
+            initialdir=self._project_dir,
         )
         root.destroy()
         if path:
@@ -523,8 +522,9 @@ class PCBViewer:
         self.fig.canvas.manager.set_window_title(title)
         self.ax.set_title(title, color='#B0C4D8', fontsize=10, pad=5)
 
-        self._top_data = data   # track most-recently opened file as top data
-        self._view_mode = 'top'
+        self._project_data = data
+        self._project_dir  = str(Path(filepath).parent)
+        self._view_mode    = 'top'
         self._show_idle_info()
         self.fig.canvas.draw_idle()
         print(f"Loaded: {filepath}")
@@ -533,52 +533,18 @@ class PCBViewer:
     # ─── TOP / BOTTOM view toggle ──────────────────────────────────────────
 
     def _on_top_view(self, _=None):
-        """Switch to TOP view: current board data with TPs and PPs."""
+        """Switch to TOP view."""
         if self._view_mode == 'top':
             return
         self._view_mode = 'top'
-        self._switch_data(self._top_data)
+        self._switch_data(self._project_data)
 
     def _on_bottom_view(self, _=None):
-        """Switch to BOTTOM view: map/ file matched to the current top file."""
+        """Switch to BOTTOM view (same file, different side filter)."""
         if self._view_mode == 'bottom':
             return
         self._view_mode = 'bottom'
-        # Always re-resolve so switching top files picks the right map file
-        self._bottom_data = None
-
-        top_path  = Path(self._top_data.get('_filepath', ''))
-        map_dir   = Path(__file__).parent / 'map'
-        all_maps  = sorted(map_dir.glob('*.txt')) + sorted(map_dir.glob('*.fab'))
-        if not all_maps:
-            self._show_info_error("No file found in map/ folder")
-            self.fig.canvas.draw_idle()
-            self._view_mode = 'top'
-            return
-
-        # Priority 1: exact filename match in map/
-        exact = map_dir / top_path.name
-        if exact.exists():
-            chosen = exact
-        else:
-            # Priority 2: file whose stem starts with the same project prefix
-            # e.g. "N244S_DVT01_fabmaster" → prefix "N244"
-            import re as _re
-            m = _re.match(r'([A-Za-z]\d+)', top_path.stem)
-            prefix = m.group(1).upper() if m else ''
-            matches = [f for f in all_maps
-                       if prefix and f.stem.upper().startswith(prefix)]
-            chosen = matches[0] if matches else all_maps[0]
-
-        try:
-            self._bottom_data = detect_and_parse(str(chosen))
-            print(f"BOTTOM data loaded: {chosen}")
-        except Exception as e:
-            self._show_info_error(str(e))
-            self.fig.canvas.draw_idle()
-            self._view_mode = 'top'
-            return
-        self._switch_data(self._bottom_data)
+        self._switch_data(self._project_data)
 
     def _switch_data(self, data: dict):
         """Rebuild indices and redraw the board with the given data dict."""
@@ -1625,35 +1591,36 @@ class PCBViewer:
 
 # ─── Entry point ─────────────────────────────────────────────────────────────
 
+def _pick_file(title: str, initialdir: str = None):
+    """Open a Tk file-picker and return the chosen path, or None if cancelled."""
+    import tkinter as tk
+    from tkinter import filedialog
+    root = tk.Tk(); root.withdraw(); root.attributes('-topmost', True)
+    path = filedialog.askopenfilename(
+        title=title,
+        filetypes=[("Fabmaster / text", "*.txt *.fab *.asc"),
+                   ("All files", "*.*")],
+        initialdir=initialdir,
+    )
+    root.destroy()
+    return path or None
+
+
 def main():
-    # ── determine initial file ────────────────────────────────────────────
+    # ── Pick the project file (used for both TOP and BOTTOM views) ────────
     if len(sys.argv) > 1:
         filepath = sys.argv[1]
     else:
-        default = Path(__file__).parent / "820-03733_N244S_EVT_fabmaster.txt"
-        if default.exists():
-            filepath = str(default)
-        else:
-            # No default → open file picker immediately
-            import tkinter as tk
-            from tkinter import filedialog
-            root = tk.Tk(); root.withdraw(); root.attributes('-topmost', True)
-            filepath = filedialog.askopenfilename(
-                title="Open PCB Layout File",
-                filetypes=[("Fabmaster / text", "*.txt *.fab *.asc"),
-                           ("All files", "*.*")],
-            )
-            root.destroy()
-            if not filepath:
-                print("No file selected. Exiting.")
-                return
+        filepath = _pick_file("Open PCB Layout File (fabmaster .txt)")
+        if not filepath:
+            print("No file selected. Exiting.")
+            return
 
     print(f"Loading {filepath} …")
     try:
         data = detect_and_parse(filepath)
     except ValueError as e:
-        print(f"Error: {e}")
-        sys.exit(1)
+        print(f"Error: {e}"); sys.exit(1)
 
     n_c   = len(data['components'])
     n_tp  = sum(1 for c in data['components'].values() if is_testpoint(c))
