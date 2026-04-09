@@ -37,31 +37,41 @@ def parse_fabmaster(filepath: str) -> dict:
     filepath = Path(filepath)
     lines    = filepath.read_text(encoding="utf-8", errors="replace").splitlines()
 
-    COMP_HEADER = ("A!REFDES!COMP_CLASS!COMP_PART_NUMBER!COMP_HEIGHT!"
-                   "COMP_DEVICE_LABEL!COMP_INSERTION_CODE!SYM_TYPE!SYM_NAME!"
-                   "SYM_MIRROR!SYM_ROTATE!SYM_X!SYM_Y!COMP_VALUE")
-    NET_HEADER  = "A!NET_NAME!REFDES!PIN_NUMBER!PIN_NAME!PIN_GROUND!PIN_POWER!"
-    PAD_HEADER  = "A!PAD_NAME!REC_NUMBER!LAYER!FIXFLAG!VIAFLAG!PADSHAPE1!PADWIDTH!PADHGHT"
-    PIN_HEADER  = "A!SYM_NAME!PIN_NAME!PIN_NUMBER!PIN_X!PIN_Y!PAD_STACK_NAME!REFDES"
+    COMP_HEADER    = ("A!REFDES!COMP_CLASS!COMP_PART_NUMBER!COMP_HEIGHT!"
+                      "COMP_DEVICE_LABEL!COMP_INSERTION_CODE!SYM_TYPE!SYM_NAME!"
+                      "SYM_MIRROR!SYM_ROTATE!SYM_X!SYM_Y!COMP_VALUE")
+    NET_HEADER     = "A!NET_NAME!REFDES!PIN_NUMBER!PIN_NAME!PIN_GROUND!PIN_POWER!"
+    PAD_HEADER     = "A!PAD_NAME!REC_NUMBER!LAYER!FIXFLAG!VIAFLAG!PADSHAPE1!PADWIDTH!PADHGHT"
+    PIN_HEADER     = "A!SYM_NAME!PIN_NAME!PIN_NUMBER!PIN_X!PIN_Y!PAD_STACK_NAME!REFDES"
+    GRAPHIC_HEADER = "A!GRAPHIC_DATA_NAME!GRAPHIC_DATA_NUMBER!RECORD_TAG!"
 
-    components: dict  = {}
-    netlist           = defaultdict(list)
-    comp_nets         = defaultdict(list)
-    outline: list     = []
-    pad_sizes: dict   = {}   # pad_stack_name -> diameter (mm)
-    tp_pad_map: dict  = {}   # refdes -> pad_stack_name
-    comp_pin_xy: dict = defaultdict(list)  # refdes -> [(pin_x, pin_y), ...]
+    # GRAPHIC_DATA subclasses that define component body outlines
+    _ASSY_TOP = frozenset(['ASSEMBLY_TOP', 'DFA_BOUND_TOP'])
+    _ASSY_BOT = frozenset(['ASSEMBLY_BOTTOM', 'PLACE_BOUND_BOTTOM'])
+    _ASSY_ALL = _ASSY_TOP | _ASSY_BOT
+
+    components: dict = {}
+    netlist          = defaultdict(list)
+    comp_nets        = defaultdict(list)
+    outline: list    = []
+    pad_sizes: dict  = {}   # pad_stack_name -> diameter (mm)
+    tp_pad_map: dict = {}   # refdes -> pad_stack_name
+    # raw outline coords collected from GRAPHIC_DATA assembly lines
+    _assy_xs: dict   = defaultdict(list)   # refdes -> [x, ...]
+    _assy_ys: dict   = defaultdict(list)   # refdes -> [y, ...]
+    comp_pins: dict  = defaultdict(list)   # refdes -> [(pin_x, pin_y, pin_name, pad_stack)]
     mode = None
 
     for line in lines:
         if not line or line[0] not in ('A', 'S'):
             continue
         if line.startswith('A!'):
-            if line.startswith(COMP_HEADER):   mode = 'comp'
-            elif line.startswith(NET_HEADER):  mode = 'net'
-            elif line.startswith(PAD_HEADER):  mode = 'pad'
-            elif line.startswith(PIN_HEADER):  mode = 'pin'
-            else:                              mode = None
+            if   line.startswith(COMP_HEADER):    mode = 'comp'
+            elif line.startswith(NET_HEADER):     mode = 'net'
+            elif line.startswith(PAD_HEADER):     mode = 'pad'
+            elif line.startswith(PIN_HEADER):     mode = 'pin'
+            elif line.startswith(GRAPHIC_HEADER): mode = 'graphic'
+            else:                                 mode = None
             continue
         if not line.startswith('S!'):
             continue
@@ -69,9 +79,11 @@ def parse_fabmaster(filepath: str) -> dict:
 
         if mode == 'comp' and len(parts) >= 13:
             try:
+                mirror = (parts[9] == 'YES')
                 components[parts[1]] = dict(
                     refdes=parts[1], comp_class=parts[2], sym_name=parts[8],
-                    mirror=(parts[9] == 'YES'),
+                    mirror=mirror,
+                    side='BOT' if mirror else 'TOP',
                     rotate=float(parts[10]),
                     x=float(parts[11]), y=float(parts[12]),
                     value=parts[13] if len(parts) > 13 else '',
@@ -85,12 +97,11 @@ def parse_fabmaster(filepath: str) -> dict:
             comp_nets[refdes].append((net, parts[3], parts[4]))
 
         elif mode == 'pad' and len(parts) >= 9:
-            # Only grab TOP layer rows with actual shape
             pad_name = parts[1]; layer = parts[3]; shape = parts[6]
             if layer == 'TOP' and shape and shape != '0.0000':
                 try:
                     w = float(parts[7]); h = float(parts[8])
-                    d = (w + h) / 2          # average for non-circle
+                    d = (w + h) / 2
                     if pad_name not in pad_sizes or d > pad_sizes[pad_name]:
                         pad_sizes[pad_name] = d
                 except ValueError:
@@ -102,9 +113,27 @@ def parse_fabmaster(filepath: str) -> dict:
             if refdes and pad_stack:
                 tp_pad_map[refdes] = pad_stack
             try:
-                comp_pin_xy[refdes].append((float(parts[4]), float(parts[5])))
+                comp_pins[refdes].append((
+                    float(parts[4]), float(parts[5]),   # absolute x, y
+                    parts[2],                            # pin name
+                    parts[3],                            # pin number
+                    pad_stack,
+                ))
             except (ValueError, IndexError):
                 pass
+
+        elif mode == 'graphic' and len(parts) >= 16:
+            # A!GRAPHIC_DATA_NAME!...!SUBCLASS!SYM_NAME!REFDES!
+            # parts[1]=type  parts[4-7]=x1,y1,x2,y2  parts[13]=subclass  parts[15]=refdes
+            subclass = parts[13]
+            if subclass in _ASSY_ALL and parts[1] in ('LINE', 'RECTANGLE'):
+                refdes = parts[15].strip()
+                if refdes:
+                    try:
+                        _assy_xs[refdes].extend([float(parts[4]), float(parts[6])])
+                        _assy_ys[refdes].extend([float(parts[5]), float(parts[7])])
+                    except (ValueError, IndexError):
+                        pass
 
         elif (len(parts) > 2 and parts[1] == 'BOARD GEOMETRY'
               and parts[2] == 'DESIGN_OUTLINE'):
@@ -124,22 +153,21 @@ def parse_fabmaster(filepath: str) -> dict:
             except ValueError:
                 pass
 
-    # Bounding box of each component from its absolute pin positions
-    PAD = 0.35   # mm margin around pin extents
+    # Build accurate bounding boxes from ASSEMBLY geometry outlines
     comp_bounds: dict = {}
-    for refdes, pts in comp_pin_xy.items():
-        if not pts:
-            continue
-        xs_p = [p[0] for p in pts]; ys_p = [p[1] for p in pts]
-        comp_bounds[refdes] = dict(
-            xmin=min(xs_p) - PAD, xmax=max(xs_p) + PAD,
-            ymin=min(ys_p) - PAD, ymax=max(ys_p) + PAD,
-        )
+    for refdes, xs in _assy_xs.items():
+        ys = _assy_ys[refdes]
+        if xs and ys:
+            comp_bounds[refdes] = dict(
+                xmin=min(xs), xmax=max(xs),
+                ymin=min(ys), ymax=max(ys),
+            )
 
     return dict(components=components, netlist=netlist,
                 comp_nets=comp_nets, outline=outline,
                 pad_sizes=pad_sizes, tp_pad_map=tp_pad_map,
-                comp_bounds=comp_bounds)
+                comp_bounds=comp_bounds,
+                comp_pins=dict(comp_pins))
 
 
 # ─── Geometry ─────────────────────────────────────────────────────────────────
@@ -397,8 +425,10 @@ class PCBViewer:
         self._top_data           = data    # original/top-side data
         self._bottom_data        = None    # loaded lazily from map/
         self._tp_collection      = None
+        self._pin_collection     = None
         self._bottom_comps       = []
         self._comp_labels        = []
+        self._bot_pin_data       = []
 
         # ── draw ─────────────────────────────────────────────────────────
         self._draw_board()
@@ -510,26 +540,44 @@ class PCBViewer:
         self._switch_data(self._top_data)
 
     def _on_bottom_view(self, _=None):
-        """Switch to BOTTOM view: components from map/ folder file."""
+        """Switch to BOTTOM view: map/ file matched to the current top file."""
         if self._view_mode == 'bottom':
             return
         self._view_mode = 'bottom'
-        if self._bottom_data is None:
-            map_dir = Path(__file__).parent / 'map'
-            candidates = sorted(map_dir.glob('*.txt')) + sorted(map_dir.glob('*.fab'))
-            if not candidates:
-                self._show_info_error("No file found in map/ folder")
-                self.fig.canvas.draw_idle()
-                self._view_mode = 'top'
-                return
-            try:
-                self._bottom_data = detect_and_parse(str(candidates[0]))
-                print(f"BOTTOM data loaded: {candidates[0]}")
-            except Exception as e:
-                self._show_info_error(str(e))
-                self.fig.canvas.draw_idle()
-                self._view_mode = 'top'
-                return
+        # Always re-resolve so switching top files picks the right map file
+        self._bottom_data = None
+
+        top_path  = Path(self._top_data.get('_filepath', ''))
+        map_dir   = Path(__file__).parent / 'map'
+        all_maps  = sorted(map_dir.glob('*.txt')) + sorted(map_dir.glob('*.fab'))
+        if not all_maps:
+            self._show_info_error("No file found in map/ folder")
+            self.fig.canvas.draw_idle()
+            self._view_mode = 'top'
+            return
+
+        # Priority 1: exact filename match in map/
+        exact = map_dir / top_path.name
+        if exact.exists():
+            chosen = exact
+        else:
+            # Priority 2: file whose stem starts with the same project prefix
+            # e.g. "N244S_DVT01_fabmaster" → prefix "N244"
+            import re as _re
+            m = _re.match(r'([A-Za-z]\d+)', top_path.stem)
+            prefix = m.group(1).upper() if m else ''
+            matches = [f for f in all_maps
+                       if prefix and f.stem.upper().startswith(prefix)]
+            chosen = matches[0] if matches else all_maps[0]
+
+        try:
+            self._bottom_data = detect_and_parse(str(chosen))
+            print(f"BOTTOM data loaded: {chosen}")
+        except Exception as e:
+            self._show_info_error(str(e))
+            self.fig.canvas.draw_idle()
+            self._view_mode = 'top'
+            return
         self._switch_data(self._bottom_data)
 
     def _switch_data(self, data: dict):
@@ -545,7 +593,8 @@ class PCBViewer:
         self._build_indices()
         self._clear_highlights()
         self.ax.cla()
-        self._tp_collection = None   # cla() removed it from axes; reset reference
+        self._tp_collection  = None   # cla() removed it from axes; reset reference
+        self._pin_collection = None
         self.ax.set_facecolor('#0A1018')
         self._draw_board()
         if self._view_mode == 'bottom':
@@ -616,8 +665,10 @@ class PCBViewer:
         ax.grid(True, color='#101820', lw=0.35, linestyle='--', zorder=0)
 
     def _draw_components(self):
-        xs = [c['x'] for c in self.data['components'].values() if not is_testpoint(c)]
-        ys = [c['y'] for c in self.data['components'].values() if not is_testpoint(c)]
+        xs = [c['x'] for c in self.data['components'].values()
+              if not is_testpoint(c) and c.get('side', 'TOP') == 'TOP']
+        ys = [c['y'] for c in self.data['components'].values()
+              if not is_testpoint(c) and c.get('side', 'TOP') == 'TOP']
         if xs:
             self.ax.scatter(xs, ys, s=5, color='#2E3E50', marker='s',
                             alpha=0.6, zorder=2, linewidths=0)
@@ -634,33 +685,59 @@ class PCBViewer:
     _COMP_COLOR_DEFAULT = '#B0BEC5'
 
     def _draw_components_bottom(self):
-        """Draw each non-TP component as a rectangle sized from actual pin bounds."""
+        """Draw BOT components as rectangles + all their pins as one PatchCollection."""
         comps = [(r, c) for r, c in self.data['components'].items()
-                 if not is_testpoint(c)]
+                 if not is_testpoint(c) and c.get('side') == 'BOT']
         if not comps:
             return
 
-        self._bottom_comps = comps   # cache for label refresh
-        bounds = self.data.get('comp_bounds', {})
+        self._bottom_comps = comps
+        bounds    = self.data.get('comp_bounds', {})
+        comp_pins = self.data.get('comp_pins', {})
+        pad_sizes = self._pad_sizes
 
-        verts  = []
-        colors = []
+        # ── component rectangles ─────────────────────────────────────────────
+        verts, rect_colors = [], []
         for refdes, c in comps:
             b = bounds.get(refdes)
             if b and (b['xmax'] - b['xmin']) > 0.05 and (b['ymax'] - b['ymin']) > 0.05:
-                # Use actual axis-aligned bounding box from pin positions
                 verts.append([(b['xmin'], b['ymin']), (b['xmax'], b['ymin']),
                                (b['xmax'], b['ymax']), (b['xmin'], b['ymax'])])
             else:
-                # Fallback: heuristic rotated rectangle
                 w, h = _comp_size(c)
                 verts.append(_rotated_box(c['x'], c['y'], w, h, c.get('rotate', 0)))
-            colors.append(self._COMP_COLORS.get(
+            rect_colors.append(self._COMP_COLORS.get(
                 c.get('comp_class', '').upper(), self._COMP_COLOR_DEFAULT))
 
-        col = PolyCollection(verts, facecolors=colors, edgecolors='#444444',
+        col = PolyCollection(verts, facecolors=rect_colors, edgecolors='#444444',
                              linewidths=0.5, alpha=0.80, zorder=4, clip_on=True)
         self.ax.add_collection(col)
+
+        # ── pin circles (data-coords → auto-scales with zoom) ───────────────
+        DEFAULT_R   = 0.045   # mm fallback
+        pin_patches = []
+        pin_colors  = []
+        self._bot_pin_data = []  # (refdes, pin_x, pin_y, pin_name, pin_number, pad_stack)
+
+        bot_refdes_set = {r for r, _ in comps}
+        for refdes, pins in comp_pins.items():
+            if refdes not in bot_refdes_set:
+                continue
+            for pin_x, pin_y, pin_name, pin_number, pad_stack in pins:
+                r = pad_sizes.get(pad_stack, 0) / 2
+                if r <= 0:
+                    r = DEFAULT_R
+                pin_patches.append(Circle((pin_x, pin_y), r))
+                pin_colors.append('#22AAFF')
+                self._bot_pin_data.append(
+                    (refdes, pin_x, pin_y, pin_name, pin_number, pad_stack))
+
+        if pin_patches:
+            self._pin_collection = PatchCollection(
+                pin_patches, facecolors=pin_colors, edgecolors='#004488',
+                linewidths=0.2, alpha=0.88, zorder=7, clip_on=True)
+            self.ax.add_collection(self._pin_collection)
+
         self._comp_labels = []   # labels drawn lazily on zoom
 
     def _refresh_bottom_labels(self):
@@ -692,6 +769,44 @@ class PCBViewer:
                 bbox=dict(boxstyle='round,pad=0.15', facecolor='#000000',
                           alpha=0.55, edgecolor='none'))
             self._comp_labels.append(t)
+
+    def _refresh_bottom_pins(self):
+        """Draw pad circles (data-coords) for BOT components visible in viewport.
+        Called on every scroll/zoom so pins scale naturally with the board."""
+        if self._pin_collection is not None:
+            try: self._pin_collection.remove()
+            except Exception: pass
+            self._pin_collection = None
+
+        if not self._bottom_comps or self._view_mode != 'bottom':
+            return
+
+        comp_pins = self.data.get('comp_pins', {})
+        pad_sizes = self._pad_sizes
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+
+        # Only show pins when few enough BOT components are in view
+        visible = [(r, c) for r, c in self._bottom_comps
+                   if xlim[0] <= c['x'] <= xlim[1] and ylim[0] <= c['y'] <= ylim[1]]
+        if len(visible) > 30:
+            return
+
+        DEFAULT_R = 0.045   # mm fallback radius
+        patches, colors = [], []
+        for refdes, _ in visible:
+            for pin_x, pin_y, _, pad_stack in comp_pins.get(refdes, []):
+                r = pad_sizes.get(pad_stack, 0) / 2
+                if r <= 0:
+                    r = DEFAULT_R
+                patches.append(Circle((pin_x, pin_y), r))
+                colors.append('#22AAFF')
+
+        if patches:
+            self._pin_collection = PatchCollection(
+                patches, facecolors=colors, edgecolors='#004488',
+                linewidths=0.2, alpha=0.88, zorder=7, clip_on=True)
+            self.ax.add_collection(self._pin_collection)
 
     def _draw_testpoints(self):
         patches, fc, ec = [], [], []
@@ -860,13 +975,33 @@ class PCBViewer:
             self.fig.canvas.draw_idle()
 
     def _handle_bottom_click(self, event):
-        """Click handler for BOTTOM view — find component rect, show info."""
+        """Click handler for BOTTOM view.
+        Priority: 1) nearest pin  2) smallest enclosing rect  3) nearest centre."""
         mx, my = event.xdata, event.ydata
+        xlim   = self.ax.get_xlim()
+        # tolerance scales with zoom: 1.5 % of viewport width
+        tol = (xlim[1] - xlim[0]) * 0.015
+
+        # ── 1. nearest pin ────────────────────────────────────────────────
+        best_pin_d, best_pin = tol, None
+        for entry in getattr(self, '_bot_pin_data', []):
+            refdes, px, py, pin_name, pin_number, pad_stack = entry
+            d = math.hypot(px - mx, py - my)
+            if d < best_pin_d:
+                best_pin_d, best_pin = d, entry
+
+        if best_pin:
+            refdes, px, py, pin_name, pin_number, pad_stack = best_pin
+            self._highlight_bottom_pin(px, py, pad_stack)
+            self._show_info_pin(refdes, pin_name, pin_number, px, py)
+            self.fig.canvas.draw_idle()
+            return
+
+        # ── 2. smallest bounding-box enclosing the click ──────────────────
         bounds = self.data.get('comp_bounds', {})
         comps  = {r: c for r, c in self.data['components'].items()
-                  if not is_testpoint(c)}
+                  if not is_testpoint(c) and c.get('side') == 'BOT'}
 
-        # Priority 1: smallest bounding box that contains the click point
         best, best_area = None, float('inf')
         for refdes, b in bounds.items():
             if refdes not in comps: continue
@@ -875,10 +1010,8 @@ class PCBViewer:
                 if area < best_area:
                     best_area, best = area, refdes
 
-        # Priority 2: nearest component centre within tolerance
+        # ── 3. nearest component centre within tolerance ───────────────────
         if best is None:
-            xlim = self.ax.get_xlim()
-            tol  = (xlim[1] - xlim[0]) * 0.015   # 1.5% of viewport width
             best_d = tol
             for refdes, c in comps.items():
                 d = math.hypot(c['x'] - mx, c['y'] - my)
@@ -926,6 +1059,58 @@ class PCBViewer:
             bbox=dict(boxstyle='round,pad=0.2', facecolor='#0A1018',
                       edgecolor='#FFDD57', linewidth=1.0, alpha=0.92))
         self._highlights.append(lbl)
+
+    def _highlight_bottom_pin(self, pin_x: float, pin_y: float, pad_stack: str):
+        """Draw a bright ring around a clicked pin."""
+        self._clear_highlights()
+        r = self._pad_sizes.get(pad_stack, 0) / 2
+        if r <= 0:
+            r = 0.045
+        ring = Circle((pin_x, pin_y), r * 2.5,
+                      fill=False, edgecolor='#FF3333', linewidth=1.8,
+                      zorder=12, linestyle='-')
+        self.ax.add_patch(ring)
+        self._highlights.append(ring)
+
+    def _show_info_pin(self, refdes: str, pin_name: str, pin_number: str,
+                       pin_x: float, pin_y: float):
+        """Show pin details in the right-hand info panel."""
+        self._clear_info()
+        comp     = self.data['components'].get(refdes, {})
+        comp_nets_list = self.data['comp_nets'].get(refdes, [])
+        ax  = self.ax_info
+        FM  = ax.transAxes
+        y   = 0.96
+
+        def t(text, col='#C0D0E0', sz=8, bold=False, dy=0.030):
+            nonlocal y
+            ax.text(0.04, y, text, transform=FM, color=col, fontsize=sz,
+                    va='top', fontweight='bold' if bold else 'normal',
+                    fontfamily='monospace', clip_on=True)
+            y -= dy
+
+        # Header
+        t(f"{refdes}", col='#FFDD57', sz=11, bold=True, dy=0.036)
+        t(f"Pin  : {pin_number}  ({pin_name})", col='#4FC3F7', sz=9, bold=True, dy=0.028)
+        t(f"Pos  : ({pin_x:.3f}, {pin_y:.3f}) mm", col='#8899AA', sz=7.5, dy=0.022)
+        t(f"Class: {comp.get('comp_class', '?')}   Value: {comp.get('value', '?')}",
+          col='#8899AA', sz=7.5, dy=0.022)
+        ax.plot([0, 1], [y, y], color='#1E2A3A', lw=0.6, transform=FM)
+        y -= 0.016
+
+        # Find net(s) for this pin (match by pin_name or pin_number)
+        pin_name_u = pin_name.upper()
+        pin_num_u  = pin_number.upper()
+        pin_nets   = [net for net, pn, pnm in comp_nets_list
+                      if pn.upper() == pin_num_u or pnm.upper() == pin_name_u]
+
+        t("Net:", col='#90CDF4', sz=8, bold=True, dy=0.026)
+        if pin_nets:
+            for net in pin_nets[:6]:
+                col = '#68D391' if not is_gnd_net(net) else '#3A5048'
+                t(f"  {net}", col=col, sz=8, dy=0.024)
+        else:
+            t("  (no connection)", col='#445566', sz=7.5, dy=0.022)
 
     # ── click on info panel row ───────────────────────────────────────────
 
