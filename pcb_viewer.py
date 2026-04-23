@@ -371,6 +371,7 @@ class PCBViewer:
         ax_open   = self.fig.add_axes([0.005, 0.952, 0.13,  0.038])
         ax_top    = self.fig.add_axes([0.145, 0.952, 0.075, 0.038])
         ax_bottom = self.fig.add_axes([0.230, 0.952, 0.085, 0.038])
+        ax_link   = self.fig.add_axes([0.330, 0.952, 0.075, 0.038])
         ax_tb   = self.fig.add_axes([0.005, 0.020, 0.42, 0.066])
         ax_btn  = self.fig.add_axes([0.430, 0.020, 0.09, 0.066])
         ax_clr  = self.fig.add_axes([0.526, 0.020, 0.07, 0.066])
@@ -387,8 +388,9 @@ class PCBViewer:
         self.btn_open   = Button(ax_open,   'Open File', color='#1A3A1A', hovercolor='#2A5A2A')
         self.btn_top    = Button(ax_top,    'TOP',       color='#1A2A3A', hovercolor='#2A4A6A')
         self.btn_bottom = Button(ax_bottom, 'BOTTOM',    color='#2A1A3A', hovercolor='#4A2A6A')
+        self.btn_link   = Button(ax_link,   'LINK',      color='#1A2A1A', hovercolor='#2A4A2A')
         for b in (self.btn_find, self.btn_clear, self.btn_open,
-                  self.btn_top, self.btn_bottom):
+                  self.btn_top, self.btn_bottom, self.btn_link):
             b.label.set_color('white'); b.label.set_fontsize(9)
 
         self.btn_find.on_clicked(self._on_search)
@@ -396,6 +398,7 @@ class PCBViewer:
         self.btn_open.on_clicked(self._on_open_file)
         self.btn_top.on_clicked(self._on_top_view)
         self.btn_bottom.on_clicked(self._on_bottom_view)
+        self.btn_link.on_clicked(self._on_toggle_link)
         self.textbox.on_submit(self._on_search)
 
         # ── panel filter textbox (right side, below info panel) ──────────
@@ -429,6 +432,8 @@ class PCBViewer:
         self._bottom_comps       = []
         self._comp_labels        = []
         self._bot_pin_data       = []
+        self._link_mode          = False   # True = board click shows all net connections
+        self._net_conn_current   = ''      # net name being shown in net-connection sidebar
 
         # Sidebar resize state
         self._sidebar_left      = 0.645   # figure fraction where info panel starts
@@ -563,6 +568,19 @@ class PCBViewer:
             return
         self._view_mode = 'bottom'
         self._switch_data(self._project_data)
+
+    def _on_toggle_link(self, _=None):
+        """Toggle LINK mode: board click shows all net connections."""
+        self._link_mode = not self._link_mode
+        if self._link_mode:
+            self.btn_link.ax.set_facecolor('#1A5A2A')
+            self.btn_link.label.set_color('#88FF88')
+            self.btn_link.label.set_fontsize(11)
+        else:
+            self.btn_link.ax.set_facecolor('#1A2A1A')
+            self.btn_link.label.set_color('white')
+            self.btn_link.label.set_fontsize(9)
+        self.fig.canvas.draw_idle()
 
     def _switch_data(self, data: dict):
         """Rebuild indices and redraw the board with the given data dict."""
@@ -1008,6 +1026,11 @@ class PCBViewer:
                 best_dist, best_r = d, refdes
 
         if best_r:
+            if self._link_mode:
+                net = self._tp_net.get(best_r, '')
+                if net:
+                    self._show_net_connections(net)
+                    return
             self._place_board_annot(best_r)
             self._show_info_tp(best_r)
         else:
@@ -1032,6 +1055,15 @@ class PCBViewer:
 
         if best_pin:
             refdes, px, py, pin_name, pin_number, pad_stack = best_pin
+            if self._link_mode:
+                comp_nets_list = self.data['comp_nets'].get(refdes, [])
+                pin_nets = [net for net, pn, pnm in comp_nets_list
+                            if str(pn) == str(pin_number)
+                            or (pnm and pnm.upper() == pin_name.upper())]
+                if pin_nets:
+                    self._show_net_connections(pin_nets[0])
+                    self.fig.canvas.draw_idle()
+                    return
             self._highlight_bottom_pin(px, py, pad_stack)
             self._show_info_pin(refdes, pin_name, pin_number, px, py)
             self.fig.canvas.draw_idle()
@@ -1159,22 +1191,37 @@ class PCBViewer:
         ax_y = self.ax_info.transAxes.inverted().transform(
             (event.x, event.y))[1]
 
-        # If we are in no_tp_pins mode, handle click on pin list row
+        # ── no_tp_pins mode: click selects a specific point ───────────────
         if self._info_mode == 'no_tp_pins' and self._no_tp_pin_rows:
-            best_dist, best_pin = 0.028, None
-            for (y_ctr, refdes, pin_num, px, py) in self._no_tp_pin_rows:
-                if abs(ax_y - y_ctr) < best_dist:
-                    best_dist = abs(ax_y - y_ctr)
-                    best_pin  = (refdes, pin_num, px, py)
-            if best_pin:
-                _, _, px, py = best_pin
-                self._highlight_single_net_pin(px, py)
+            best_dist, best_row = 0.028, None
+            for row in self._no_tp_pin_rows:
+                if abs(ax_y - row[0]) < best_dist:
+                    best_dist = abs(ax_y - row[0])
+                    best_row  = row
+            if best_row:
+                _, refdes, pin_num, px, py, side, is_tp, pad_stack = best_row
+                # Auto-switch side if needed
+                saved_net = self._net_conn_current
+                if side == 'TOP' and self._view_mode != 'top':
+                    self._on_top_view()          # redraws board & clears state
+                    self._show_net_connections(saved_net)   # re-populate
+                elif side == 'BOT' and self._view_mode != 'bottom':
+                    self._on_bottom_view()
+                    self._show_net_connections(saved_net)
+                # Clear all orange highlights, draw single red selected patch
+                for a in list(self._highlights):
+                    try: a.remove()
+                    except Exception: pass
+                self._highlights.clear()
+                patch = self._make_pad_highlight_patch(px, py, pad_stack, is_tp, '#FF2222')
+                self.ax.add_patch(patch)
+                self._highlights.append(patch)
                 self._pan_to_point(px, py)
-                return
+            return
 
-        # Normal TP rows
-        best_dist, best_tp = 0.028, None
-        best_no_tp_net      = None
+        # ── normal comp/net table mode ────────────────────────────────────
+        best_dist, best_tp     = 0.028, None
+        best_no_tp_net         = None
         for (y_ctr, tp_r, net) in self._info_rows:
             dist = abs(ax_y - y_ctr)
             if dist < best_dist:
@@ -1230,101 +1277,147 @@ class PCBViewer:
         self.fig.canvas.draw_idle()
 
     def _handle_no_tp_click(self, net: str):
-        """User clicked a no-TP signal. Highlight all connected component pins on current side."""
+        """User clicked a no-TP signal row. Show all net connections."""
+        self._show_net_connections(net)
+
+    def _show_net_connections(self, net: str):
+        """Unified: collect ALL points on net, highlight current-side on board, list all in sidebar."""
+        self._net_conn_current = net
         netlist    = self.data.get('netlist', {})
         comp_pins  = self.data.get('comp_pins', {})
         components = self.data['components']
+        current_side = 'TOP' if self._view_mode == 'top' else 'BOT'
 
-        connected = []   # (refdes, pin_num, pin_name, px, py)
+        # Collect ALL connected points from BOTH sides
+        # each entry: (label, refdes, pin_num_or_none, px, py, side, is_tp, pad_stack)
+        all_points = []
         for refdes, pn, pnm in netlist.get(net, []):
             comp = components.get(refdes)
-            if not comp or is_testpoint(comp):
+            if not comp:
                 continue
             comp_side = comp.get('side', 'TOP')
-            # Only show components on the currently visible side
-            if self._view_mode == 'top'    and comp_side != 'TOP': continue
-            if self._view_mode == 'bottom' and comp_side != 'BOT': continue
-            # Find pin coordinates
-            for px, py, pin_name, pin_number, _pad in comp_pins.get(refdes, []):
-                if str(pin_number) == str(pn) or (pnm and pin_name.upper() == pnm.upper()):
-                    connected.append((refdes, pn, pnm, px, py))
-                    break
+            is_tp = is_testpoint(comp)
 
-        # Highlight all found pins on the board (scatter orange rings)
+            if is_tp:
+                tp = self._testpoints.get(refdes)
+                if not tp:
+                    continue
+                pad_stack = self._tp_pad_map.get(refdes, '')
+                all_points.append((refdes, refdes, None, tp['x'], tp['y'],
+                                   comp_side, True, pad_stack))
+            else:
+                for px, py, pin_name, pin_number, pad_stack in comp_pins.get(refdes, []):
+                    if str(pin_number) == str(pn) or (pnm and pin_name.upper() == pnm.upper()):
+                        label = f'{refdes}.{pn}'
+                        all_points.append((label, refdes, pn, px, py,
+                                           comp_side, False, pad_stack))
+                        break
+
+        # Highlight only current-side points on board (shape-aware)
         self._clear_highlights()
-        if connected:
-            import numpy as _np
-            xs = [p[3] for p in connected]
-            ys = [p[4] for p in connected]
-            sc = self.ax.scatter(xs, ys, s=220, facecolors='none',
-                                 edgecolors='#FF8800', linewidths=2.2,
-                                 zorder=15, marker='o')
-            self._highlights.append(sc)
+        for _lbl, refdes, pin_num, px, py, side, is_tp, pad_stack in all_points:
+            if side != current_side:
+                continue
+            patch = self._make_pad_highlight_patch(px, py, pad_stack, is_tp, '#FF8800')
+            self.ax.add_patch(patch)
+            self._highlights.append(patch)
         self.fig.canvas.draw_idle()
 
-        # Show sidebar with pin list
-        self._show_no_tp_pins(net, connected)
+        # Draw sidebar with complete list
+        self._draw_net_conn_sidebar(net, all_points, current_side)
 
-    def _show_no_tp_pins(self, net: str, connected: list):
-        """Sidebar display: list of component pins connected to a no-TP net."""
+    def _make_pad_highlight_patch(self, px, py, pad_stack, is_tp, color):
+        """Return a highlight patch shaped to the pad type."""
+        raw  = self._pad_sizes.get(pad_stack, 0.0)
+        size = max(0.12, min(0.40, raw * 0.5)) if raw else 0.15
+        if is_tp:
+            return Circle((px, py), size * 2.2,
+                          fill=False, edgecolor=color, linewidth=2.2, zorder=15)
+        # Component pin — use rectangle (SMD default)
+        hw = size * 1.8 * 1.2   # half-width (slightly wider)
+        hh = size * 1.8 * 0.8   # half-height
+        ps_up = (pad_stack or '').upper()
+        if any(s in ps_up for s in ('SQ', 'SQUARE')):
+            hw = hh = size * 1.8
+        return mpatches.Rectangle((px - hw, py - hh), hw * 2, hh * 2,
+                                   fill=False, edgecolor=color,
+                                   linewidth=2.2, zorder=15)
+
+    def _draw_net_conn_sidebar(self, net: str, all_points: list, current_side: str):
+        """Sidebar: list ALL connected points for net (no coordinates), grouped by side."""
         ax = self.ax_info
         ax.cla(); ax.axis('off'); ax.set_facecolor('#0A1018')
         self._info_rows.clear()
         self._no_tp_pin_rows = []
         self._info_mode      = 'no_tp_pins'
-        FM = ax.transAxes
-        y  = 0.985
+        FM  = ax.transAxes
+        y   = 0.985
+        DY  = 0.038
 
+        # Header
         ax.text(0.03, y, f'Net: {net}', transform=FM, color='#FFAA44',
-                fontsize=13, va='top', fontweight='bold', fontfamily='monospace',
-                clip_on=True)
-        y -= 0.055
-        ax.text(0.03, y, 'Không có Test Point', transform=FM,
-                color='#FC8181', fontsize=10, va='top', fontfamily='monospace')
-        y -= 0.038
-        ax.plot([0, 1], [y, y], color='#1E2A3A', lw=0.7, transform=FM)
-        y -= 0.015
+                fontsize=13, va='top', fontweight='bold',
+                fontfamily='monospace', clip_on=True)
+        y -= 0.052
 
-        if not connected:
-            side_name = 'TOP' if self._view_mode == 'top' else 'BOTTOM'
-            ax.text(0.03, y,
-                    f'Không có linh kiện ở mặt {side_name}',
-                    transform=FM, color='#6A7E94', fontsize=10, va='top',
-                    fontfamily='monospace')
+        n_total = len(all_points)
+        n_this  = sum(1 for p in all_points if p[5] == current_side)
+        side_name = 'TOP' if current_side == 'TOP' else 'BOTTOM'
+        ax.text(0.03, y,
+                f'{n_total} điểm  •  highlight: {n_this} ở {side_name}',
+                transform=FM, color='#6A8EA0', fontsize=9,
+                va='top', fontfamily='monospace')
+        y -= 0.030
+        ax.plot([0, 1], [y, y], color='#1E2A3A', lw=0.7, transform=FM)
+        y -= 0.014
+
+        if not all_points:
+            ax.text(0.03, y, 'Không tìm thấy điểm kết nối',
+                    transform=FM, color='#FC8181', fontsize=10,
+                    va='top', fontfamily='monospace')
             self.fig.canvas.draw_idle()
             return
 
-        ax.text(0.03, y, f'Điểm kết nối ({len(connected)}):',
-                transform=FM, color='#90CDF4', fontsize=11, va='top',
-                fontweight='bold', fontfamily='monospace')
-        y -= 0.040
-        ax.plot([0, 1], [y, y], color='#253545', lw=0.5, transform=FM)
+        # Sort: current-side first → TPs before pins → alphabetical
+        def _sort_key(p):
+            same = 0 if p[5] == current_side else 1
+            is_tp = 0 if p[6] else 1
+            return (same, is_tp, p[0])
+        sorted_pts = sorted(all_points, key=_sort_key)
 
-        DY = 0.038
-        y -= DY * 0.35
-
-        ax.text(0.03, y, 'LINH KIỆN.PIN', transform=FM, color='#90CDF4',
-                fontsize=9, va='top', fontweight='bold', fontfamily='monospace')
-        ax.text(0.60, y, 'VỊ TRÍ (mm)', transform=FM, color='#90CDF4',
-                fontsize=9, va='top', fontweight='bold', fontfamily='monospace')
-        y -= DY * 0.75
-        ax.plot([0, 1], [y, y], color='#253545', lw=0.4, transform=FM)
-        y -= DY * 0.30
-
-        for refdes, pin_num, pin_name, px, py in connected:
+        prev_side = None
+        for label, refdes, pin_num, px, py, side, is_tp, pad_stack in sorted_pts:
             if y < 0.04:
                 ax.text(0.03, y, '  …', transform=FM, color='#445566',
                         fontsize=9, va='top', fontfamily='monospace')
                 break
-            label = f'{refdes}.{pin_num}'
-            if pin_name and pin_name.strip().upper() not in ('', 'NC'):
-                label += f' ({pin_name})'
-            ax.text(0.03, y, label, transform=FM, color='#FFA07A',
+
+            # Group header when side changes
+            if side != prev_side:
+                grp_name = 'TOP' if side == 'TOP' else 'BOTTOM'
+                marker   = '●' if side == current_side else '○'
+                grp_col  = '#4A8840' if side == current_side else '#3A4A5A'
+                ax.text(0.03, y, f'{marker} {grp_name}',
+                        transform=FM, color=grp_col, fontsize=8,
+                        va='top', fontfamily='monospace', style='italic')
+                y -= DY * 0.55
+                ax.plot([0.01, 0.96], [y + DY * 0.15, y + DY * 0.15],
+                        color='#1A2A38', lw=0.5, transform=FM)
+                y -= DY * 0.15
+                prev_side = side
+
+            col = '#00CFFF' if is_tp else '#FFA07A'
+            ax.text(0.06, y, label, transform=FM, color=col,
                     fontsize=9, va='top', fontfamily='monospace', clip_on=True)
-            pos_str = f'({px:.2f},{py:.2f})'
-            ax.text(0.60, y, pos_str, transform=FM, color='#6A8EA0',
-                    fontsize=8.5, va='top', fontfamily='monospace', clip_on=True)
-            self._no_tp_pin_rows.append((y - DY * 0.40, refdes, pin_num, px, py))
+
+            # Grey marker for other side (not highlighted)
+            if side != current_side:
+                other_tag = '[B]' if side == 'BOT' else '[T]'
+                ax.text(0.84, y, other_tag, transform=FM, color='#445566',
+                        fontsize=8, va='top', fontfamily='monospace')
+
+            self._no_tp_pin_rows.append(
+                (y - DY * 0.40, refdes, pin_num, px, py, side, is_tp, pad_stack))
             y -= DY
 
         self.fig.canvas.draw_idle()
@@ -1348,6 +1441,7 @@ class PCBViewer:
         self._info_mode      = 'idle'
         self._info_net_query = ''
         self._no_tp_pin_rows = []
+        self._net_conn_current   = ''
 
     def _on_clear(self, _=None):
         self.textbox.set_val('')
