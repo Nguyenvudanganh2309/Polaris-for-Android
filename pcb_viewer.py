@@ -1410,12 +1410,6 @@ class PCBViewer:
             ax.text(0.06, y, label, transform=FM, color=col,
                     fontsize=9, va='top', fontfamily='monospace', clip_on=True)
 
-            # Grey marker for other side (not highlighted)
-            if side != current_side:
-                other_tag = '[B]' if side == 'BOT' else '[T]'
-                ax.text(0.84, y, other_tag, transform=FM, color='#445566',
-                        fontsize=8, va='top', fontfamily='monospace')
-
             self._no_tp_pin_rows.append(
                 (y - DY * 0.40, refdes, pin_num, px, py, side, is_tp, pad_stack))
             y -= DY
