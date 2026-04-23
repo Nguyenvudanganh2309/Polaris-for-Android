@@ -1,14 +1,14 @@
 """
 PCB Layout Viewer – Fabmaster (.txt) format  v3
 ================================================
-* Board outline (SIP shape) với lines + arcs
-* Test points (TP / TPA / PPA …) vẽ bằng Circle patch data-coords
-  → tự động scale khi zoom in/out
-* Không hiện label mặc định – chỉ hiện khi:
-    - Click chuột trái vào test point
-    - Search linh kiện và test point được highlight
-* Khi search: bỏ qua các test point chỉ kết nối qua GND
-* Click vào vùng trống để bỏ label
+* Board outline with lines + arcs
+* Test points (TP / TPA / PPA …) drawn as Circle patches in data-coords
+  → scale automatically on zoom
+* Labels hidden by default – shown only when:
+    - Left-clicking a test point
+    - Searching a component / test point (highlighted)
+* Search: ignores test points connected only through GND nets
+* Click on empty board area to clear label
 
 Usage
 -----
@@ -18,6 +18,7 @@ Usage
 
 import math
 import sys
+import time
 from pathlib import Path
 from collections import defaultdict
 
@@ -434,6 +435,7 @@ class PCBViewer:
         self._bot_pin_data       = []
         self._link_mode          = False   # True = board click shows all net connections
         self._net_conn_current   = ''      # net name being shown in net-connection sidebar
+        self._last_table_redraw  = 0.0     # perf_counter timestamp of last _redraw_info_table
 
         # Sidebar resize state
         self._sidebar_left      = 0.645   # figure fraction where info panel starts
@@ -593,6 +595,7 @@ class PCBViewer:
         self._comp_to_tps = defaultdict(lambda: defaultdict(list))
         self._tp_order    = []
         self._build_indices()
+        self._comp_label_map = {}   # cla() removes artists; reset reference
         self._clear_highlights()
         self.ax.cla()
         self._tp_collection  = None   # cla() removed it from axes; reset reference
@@ -644,6 +647,13 @@ class PCBViewer:
             for net, pin_n, pin_nm in comp_nets.get(refdes, []):
                 for tp in tp_by_net.get(net, []):
                     self._comp_to_tps[refdes][tp].append((net, pin_n, pin_nm))
+
+        # Cache click tolerance (max TP pad radius × 3) so _handle_board_click
+        # doesn't recompute it on every click.
+        self._tp_click_tol = (
+            max(self._r(c) * 3.0 for _, c in self._tp_order)
+            if self._tp_order else 1.0
+        )
 
     # ─── drawing ──────────────────────────────────────────────────────────
 
@@ -740,37 +750,37 @@ class PCBViewer:
                 linewidths=0.2, alpha=0.88, zorder=7, clip_on=True)
             self.ax.add_collection(self._pin_collection)
 
-        self._comp_labels = []   # labels drawn lazily on zoom
-
-    def _refresh_bottom_labels(self):
-        """Show refdes labels only for components visible in the current viewport.
-        Called after every zoom/pan in BOTTOM mode."""
-        for t in getattr(self, '_comp_labels', []):
-            try: t.remove()
-            except Exception: pass
-        self._comp_labels = []
-
-        comps = getattr(self, '_bottom_comps', [])
-        if not comps:
-            return
-
-        xlim = self.ax.get_xlim()
-        ylim = self.ax.get_ylim()
-        visible = [(r, c) for r, c in comps
-                   if xlim[0] <= c['x'] <= xlim[1] and ylim[0] <= c['y'] <= ylim[1]]
-
-        # Only render labels when few enough components are in view
-        if len(visible) > 80:
-            return
-
-        for refdes, c in visible:
+        # Pre-create all label artists (hidden); toggled by _refresh_bottom_labels
+        self._comp_label_map: dict = {}
+        for refdes, c in comps:
             t = self.ax.text(
                 c['x'], c['y'], refdes,
                 fontsize=7, color='white', ha='center', va='center',
-                fontweight='bold', zorder=6, clip_on=True,
+                fontweight='bold', zorder=6, clip_on=True, visible=False,
                 bbox=dict(boxstyle='round,pad=0.15', facecolor='#000000',
                           alpha=0.55, edgecolor='none'))
-            self._comp_labels.append(t)
+            self._comp_label_map[refdes] = t
+
+    def _refresh_bottom_labels(self):
+        """Toggle label visibility for components in the current viewport.
+        No artists are created or destroyed — only set_visible() is called."""
+        label_map = getattr(self, '_comp_label_map', {})
+        if not label_map:
+            return
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+        comps = getattr(self, '_bottom_comps', [])
+        in_view = [
+            (r, c) for r, c in comps
+            if xlim[0] <= c['x'] <= xlim[1] and ylim[0] <= c['y'] <= ylim[1]
+        ]
+        show_labels = len(in_view) <= 80
+        for refdes, c in comps:
+            artist = label_map.get(refdes)
+            if artist is None:
+                continue
+            in_viewport = xlim[0] <= c['x'] <= xlim[1] and ylim[0] <= c['y'] <= ylim[1]
+            artist.set_visible(show_labels and in_viewport)
 
     def _refresh_bottom_pins(self):
         """Draw pad circles (data-coords) for BOT components visible in viewport.
@@ -896,14 +906,17 @@ class PCBViewer:
             self.fig.canvas.draw_idle()
 
         elif event.inaxes == self.ax_info:
-            # ── scroll info table ─────────────────────────────────────────
+            # ── scroll info table — rate-limited to 30 fps ────────────────
             if not self._all_info_rows: return
             delta   = -2 if event.button == 'up' else 2
             total   = len(self._filtered_rows())
             max_off = max(0, total - self._info_visible)
             self._info_scroll = max(0, min(max_off, self._info_scroll + delta))
-            self._redraw_info_table()
-            self.fig.canvas.draw_idle()
+            now = time.perf_counter()
+            if now - self._last_table_redraw >= 1 / 30:
+                self._last_table_redraw = now
+                self._redraw_info_table()
+                self.fig.canvas.draw_idle()
 
     # ─── sidebar resize ───────────────────────────────────────────────────────
 
@@ -949,13 +962,16 @@ class PCBViewer:
         new_left = (event.x - bbox.x0) / bbox.width + 0.008
         self._sidebar_left = max(0.25, min(0.90, new_left))
         self._resize_layout()
-        if self._info_mode not in ('idle',):
-            self._redraw_info_table()
+        # Skip table rebuild during drag — axes-fraction text repositions automatically.
+        # One clean redraw fires on mouse release.
         self.fig.canvas.draw_idle()
 
     def _on_release(self, event):
         if self._dragging_sidebar:
             self._dragging_sidebar = False
+            if self._info_mode not in ('idle',):
+                self._redraw_info_table()
+            self.fig.canvas.draw_idle()
 
     # ─── board annotation helpers ──────────────────────────────────────────
 
@@ -1018,7 +1034,7 @@ class PCBViewer:
             self._handle_bottom_click(event)
             return
 
-        TOL = max(self._r(c) * 3.0 for _, c in self._tp_order) if self._tp_order else 1.0
+        TOL = self._tp_click_tol
         best_dist, best_r = TOL, None
         for refdes, c in self._tp_order:
             d = math.hypot(c['x'] - event.xdata, c['y'] - event.ydata)
@@ -1364,7 +1380,7 @@ class PCBViewer:
         n_this  = sum(1 for p in all_points if p[5] == current_side)
         side_name = 'TOP' if current_side == 'TOP' else 'BOTTOM'
         ax.text(0.03, y,
-                f'{n_total} điểm  •  highlight: {n_this} ở {side_name}',
+                f'{n_total} points  •  highlighted: {n_this} on {side_name}',
                 transform=FM, color='#6A8EA0', fontsize=9,
                 va='top', fontfamily='monospace')
         y -= 0.030
@@ -1372,7 +1388,7 @@ class PCBViewer:
         y -= 0.014
 
         if not all_points:
-            ax.text(0.03, y, 'Không tìm thấy điểm kết nối',
+            ax.text(0.03, y, 'No connection points found',
                     transform=FM, color='#FC8181', fontsize=10,
                     va='top', fontfamily='monospace')
             self.fig.canvas.draw_idle()
@@ -1879,19 +1895,19 @@ class PCBViewer:
         ax.text(0.5, 0.60, "PCB Layout Viewer",
                 transform=ax.transAxes, color='#3D5A80',
                 fontsize=18, ha='center', fontweight='bold')
-        ax.text(0.5, 0.53, "Nhap refdes → Find  hoac  Click vao TP",
+        ax.text(0.5, 0.53, "Enter refdes → Find   or   Click on a TP",
                 transform=ax.transAxes, color='#2A3A50',
                 fontsize=12, ha='center')
-        ax.text(0.5, 0.47, "(vd: U7500  U3100  TPA033  PPA301)",
+        ax.text(0.5, 0.47, "(e.g. U7500  U3100  TPA033  PPA301)",
                 transform=ax.transAxes, color='#22303E',
                 fontsize=11, ha='center', style='italic')
-        ax.text(0.5, 0.38, "Click dong trong bang → highlight TP",
+        ax.text(0.5, 0.38, "Click a row in the table → highlight TP",
                 transform=ax.transAxes, color='#1E3040',
                 fontsize=11, ha='center')
         n_tp   = len(self._testpoints)
         n_comp = len(self.data['components']) - n_tp
         n_net  = len(self.data['netlist'])
-        for i, t in enumerate([f"{n_comp} linh kien",
+        for i, t in enumerate([f"{n_comp} components",
                                 f"{n_tp} test points",
                                 f"{n_net} nets"]):
             ax.text(0.5, 0.28 - i*0.07, t, transform=ax.transAxes,
@@ -1899,7 +1915,7 @@ class PCBViewer:
 
     def _show_info_none(self, query: str):
         self._clear_info()
-        self.ax_info.text(0.5, 0.55, f'Khong tim thay "{query}"',
+        self.ax_info.text(0.5, 0.55, f'Not found: "{query}"',
                           transform=self.ax_info.transAxes,
                           color='#FC8181', fontsize=14, ha='center')
 
