@@ -1263,7 +1263,7 @@ class PCBViewer:
         if self._info_mode == 'net' and (best_tp or best_no_tp_net):
             self._show_net_connections(best_net or best_no_tp_net)
         elif best_tp:
-            self._clear_highlights()
+            self._clear_board_highlights()
             self._place_board_annot(best_tp)
             self._pan_to_tp(best_tp)
         elif best_no_tp_net:
@@ -1469,6 +1469,18 @@ class PCBViewer:
         self._no_tp_pin_rows = []
         self._net_conn_current   = ''
         self._net_conn_points    = []
+
+    def _clear_board_highlights(self):
+        """Remove board highlight patches/rings/annotation; preserve info-panel state."""
+        for a in self._highlights:
+            try: a.remove()
+            except Exception: pass
+        self._highlights.clear()
+        if self._ring_collection:
+            try: self._ring_collection.remove()
+            except Exception: pass
+            self._ring_collection = None
+        self._remove_board_annot()
 
     def _on_clear(self, _=None):
         self.textbox.set_val('')
