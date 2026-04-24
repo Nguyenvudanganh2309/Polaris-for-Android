@@ -425,6 +425,8 @@ class PCBViewer:
         self._panel_filter       = ''    # current filter string
         self._info_mode          = 'idle'  # 'idle' | 'comp' | 'net' | 'tp'
         self._info_net_query     = ''
+        self._search_results: list = []    # ranked search candidates
+        self._selected_result_idx = 0
         self._view_mode          = 'top'   # 'top' | 'bottom'
         self._project_data       = data    # the one loaded file — used for both views
         self._project_dir        = str(Path(data.get('_filepath', __file__)).parent)
@@ -1215,6 +1217,21 @@ class PCBViewer:
         ax_y = self.ax_info.transAxes.inverted().transform(
             (event.x, event.y))[1]
 
+        if self._info_mode == 'search_results' and self._search_results:
+            best_dist, best_idx = 0.028, None
+            for y_ctr, idx, _ in self._info_rows:
+                dist = abs(ax_y - y_ctr)
+                if dist < best_dist:
+                    best_dist, best_idx = dist, idx
+            if best_idx is not None and 0 <= best_idx < len(self._search_results):
+                _score, kind, key = self._search_results[best_idx]
+                if kind == 'net':
+                    self._show_info_nets(str(key), [str(key)])
+                else:
+                    self.textbox.set_val(str(key))
+                    self._on_search(str(key))
+            return
+
         # ── no_tp_pins mode: click selects a specific point ───────────────
         if self._info_mode == 'no_tp_pins' and self._no_tp_pin_rows:
             best_dist, best_row = 0.028, None
@@ -1450,6 +1467,19 @@ class PCBViewer:
 
     # ─── search / highlight ───────────────────────────────────────────────
 
+    def _reset_info_state(self):
+        self._info_rows.clear()
+        self._all_info_rows.clear()
+        self._info_scroll    = 0
+        self._current_comp   = None
+        self._info_mode      = 'idle'
+        self._info_net_query = ''
+        self._no_tp_pin_rows = []
+        self._net_conn_current   = ''
+        self._net_conn_points    = []
+        self._search_results     = []
+        self._selected_result_idx = 0
+
     def _clear_highlights(self):
         for a in self._highlights:
             try: a.remove()
@@ -1460,15 +1490,7 @@ class PCBViewer:
             except Exception: pass
             self._ring_collection = None
         self._remove_board_annot()
-        self._info_rows.clear()
-        self._all_info_rows.clear()
-        self._info_scroll    = 0
-        self._current_comp   = None
-        self._info_mode      = 'idle'
-        self._info_net_query = ''
-        self._no_tp_pin_rows = []
-        self._net_conn_current   = ''
-        self._net_conn_points    = []
+        self._reset_info_state()
 
     def _clear_board_highlights(self):
         """Remove board highlight patches/rings/annotation; preserve info-panel state."""
@@ -1501,53 +1523,66 @@ class PCBViewer:
         comps     = self.data['components']
         comp_nets = self.data['comp_nets']
         netlist   = self.data['netlist']
+        candidates = []
 
-        # 1. Exact refdes match
-        matches = [r for r in comps if r.upper() == query]
+        for refdes, comp in comps.items():
+            ru = refdes.upper()
+            side_bonus = 5 if comp.get('side', 'TOP') == ('TOP' if self._view_mode == 'top' else 'BOT') else 0
+            if ru == query:
+                candidates.append((100 + side_bonus, 'comp', refdes))
+            elif ru.startswith(query):
+                candidates.append((80 + side_bonus, 'comp', refdes))
+            elif query in ru:
+                candidates.append((70 + side_bonus, 'comp', refdes))
 
-        # 2. Refdes prefix match
-        if not matches:
-            matches = [r for r in comps if r.upper().startswith(query)]
+        for net in netlist:
+            nu = net.upper()
+            if nu == query:
+                candidates.append((90, 'net', net))
+            elif query in nu:
+                candidates.append((50, 'net', net))
 
-        # 3. Net / signal name substring — runs BEFORE refdes substring so that
-        #    signal-name queries like "VS1" find all "PP_VS1_PMU" nets directly.
-        if not matches:
-            found_nets = [n for n in netlist if query in n.upper()]
-            if found_nets:
-                self._show_info_nets(query, found_nets)
-                self.fig.canvas.draw_idle()
-                return
+        # TP-driven component candidates
+        tp_match = next((r for r in self._testpoints if r.upper() == query), None)
+        if tp_match is None:
+            tp_match = next((r for r in self._testpoints if r.upper().startswith(query)), None)
+        if tp_match is None:
+            tp_match = next((r for r in self._testpoints if query in r.upper()), None)
+        if tp_match:
+            nets_of_tp = [n for n, _, _ in comp_nets.get(tp_match, [])]
+            seen = set()
+            for net in nets_of_tp:
+                for r, _, _ in netlist.get(net, []):
+                    if r not in seen and r in comps and not is_testpoint(comps[r]):
+                        seen.add(r)
+                        candidates.append((60, 'comp', r))
 
-        # 4. Refdes substring match (fallback after net search)
-        if not matches:
-            matches = [r for r in comps if query in r.upper()]
-
-        # 5. TP refdes — find components connected to this TP
-        if not matches:
-            tp_match = next((r for r in self._testpoints if r.upper() == query), None)
-            if tp_match is None:
-                tp_match = next((r for r in self._testpoints
-                                 if r.upper().startswith(query)), None)
-            if tp_match is None:
-                tp_match = next((r for r in self._testpoints
-                                 if query in r.upper()), None)
-            if tp_match:
-                # Collect non-TP comps that share a net with this TP
-                nets_of_tp = [n for n, _, _ in comp_nets.get(tp_match, [])]
-                seen = set()
-                for net in nets_of_tp:
-                    for r, _, _ in netlist.get(net, []):
-                        if r not in seen and r in comps and not is_testpoint(comps[r]):
-                            seen.add(r)
-                            matches.append(r)
-
-        if not matches:
+        if not candidates:
             self._show_info_none(query)
             self.fig.canvas.draw_idle()
             return
 
-        refdes = matches[0]
-        comp   = comps[refdes]
+        # Stable ranking: score desc, shorter id first, alphabetical
+        candidates.sort(key=lambda t: (-t[0], len(str(t[2])), str(t[2])))
+        top_score = candidates[0][0]
+        top_band = [c for c in candidates if top_score - c[0] <= 5]
+        if len(top_band) > 1:
+            self._show_info_search_results(query, candidates[:100])
+            self.fig.canvas.draw_idle()
+            return
+
+        kind, key = candidates[0][1], candidates[0][2]
+        if kind == 'net':
+            self._show_info_nets(query, [key])
+            self.fig.canvas.draw_idle()
+            return
+
+        refdes = key
+        comp   = comps.get(refdes)
+        if not comp:
+            self._show_info_none(query)
+            self.fig.canvas.draw_idle()
+            return
         self._current_comp = refdes
 
         raw_map = self._comp_to_tps.get(refdes, {})
@@ -1609,6 +1644,8 @@ class PCBViewer:
         self._info_rows.clear()
         self._all_info_rows.clear()
         self._info_scroll = 0
+        self._search_results = []
+        self._selected_result_idx = 0
 
     # ── Click on TP: show TP info in panel ───────────────────────────────
     def _show_info_tp(self, refdes: str):
@@ -1888,10 +1925,12 @@ class PCBViewer:
             if is_gnd_net(net):
                 continue
             tps = tp_by_net.get(net, [])
-            tp_r = tps[0] if tps else None
-            if tp_r:
-                all_tp_refdes.add(tp_r)
-            rows.append((net, '', '', tp_r))
+            if tps:
+                for tp_r in sorted(set(tps)):
+                    all_tp_refdes.add(tp_r)
+                    rows.append((net, '', '', tp_r))
+            else:
+                rows.append((net, '', '', None))
 
         def _sort_key(row):
             tp_r = row[3]
@@ -1921,6 +1960,41 @@ class PCBViewer:
             self.ax.add_collection(self._ring_collection)
 
         self._redraw_info_table()
+
+    def _show_info_search_results(self, query: str, results: list):
+        """Show ranked mixed search results (components + nets)."""
+        self._clear_info()
+        self._info_mode = 'search_results'
+        self._search_results = results
+        self._selected_result_idx = 0
+        ax = self.ax_info
+        FM = ax.transAxes
+        y = 0.985
+        DY = 0.034
+        self._info_rows.clear()
+
+        ax.text(0.03, y, f'Search: "{query}"', transform=FM, color='#AAFFCC',
+                fontsize=13, va='top', fontweight='bold', fontfamily='monospace')
+        y -= 0.048
+        ax.text(0.03, y, f'{len(results)} close matches, click a row to focus',
+                transform=FM, color='#6A8EA0', fontsize=9, va='top',
+                fontfamily='monospace')
+        y -= 0.028
+        ax.plot([0, 1], [y, y], color='#1E2A3A', lw=0.7, transform=FM)
+        y -= 0.012
+
+        for idx, (score, kind, key) in enumerate(results[:28]):
+            if y < 0.04:
+                ax.text(0.03, y, '  …', transform=FM, color='#445566',
+                        fontsize=9, va='top', fontfamily='monospace')
+                break
+            tag = 'COMP' if kind == 'comp' else 'NET'
+            col = '#9AE6B4' if kind == 'comp' else '#90CDF4'
+            text = f'[{tag}] {key:<20}  score={score}'
+            ax.text(0.04, y, text, transform=FM, color=col,
+                    fontsize=9, va='top', fontfamily='monospace', clip_on=True)
+            self._info_rows.append((y - DY * 0.4, idx, None))
+            y -= DY
 
     def _show_idle_info(self):
         self._clear_info()
