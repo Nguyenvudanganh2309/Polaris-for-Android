@@ -435,6 +435,7 @@ class PCBViewer:
         self._bot_pin_data       = []
         self._link_mode          = False   # True = board click shows all net connections
         self._net_conn_current   = ''      # net name being shown in net-connection sidebar
+        self._net_conn_points: list = []   # cached all_points from last _show_net_connections
         self._last_table_redraw  = 0.0     # perf_counter timestamp of last _redraw_info_table
 
         # Sidebar resize state
@@ -969,7 +970,13 @@ class PCBViewer:
     def _on_release(self, event):
         if self._dragging_sidebar:
             self._dragging_sidebar = False
-            if self._info_mode not in ('idle',):
+            if self._info_mode == 'no_tp_pins' and self._net_conn_current:
+                # Redraw net-connection sidebar with updated column widths/truncation;
+                # do NOT call _clear_highlights so board highlights are preserved.
+                current_side = 'TOP' if self._view_mode == 'top' else 'BOT'
+                self._draw_net_conn_sidebar(
+                    self._net_conn_current, self._net_conn_points, current_side)
+            elif self._info_mode not in ('idle',):
                 self._redraw_info_table()
             self.fig.canvas.draw_idle()
 
@@ -1329,6 +1336,8 @@ class PCBViewer:
                                            comp_side, False, pad_stack))
                         break
 
+        self._net_conn_points = all_points   # cache for sidebar-resize redraw
+
         # Highlight only current-side points on board (shape-aware)
         self._clear_highlights()
         for _lbl, refdes, pin_num, px, py, side, is_tp, pad_stack in all_points:
@@ -1452,6 +1461,7 @@ class PCBViewer:
         self._info_net_query = ''
         self._no_tp_pin_rows = []
         self._net_conn_current   = ''
+        self._net_conn_points    = []
 
     def _on_clear(self, _=None):
         self.textbox.set_val('')
@@ -1476,13 +1486,24 @@ class PCBViewer:
         # 1. Exact refdes match
         matches = [r for r in comps if r.upper() == query]
 
-        # 2. Refdes prefix / substring
+        # 2. Refdes prefix match
         if not matches:
             matches = [r for r in comps if r.upper().startswith(query)]
+
+        # 3. Net / signal name substring — runs BEFORE refdes substring so that
+        #    signal-name queries like "VS1" find all "PP_VS1_PMU" nets directly.
+        if not matches:
+            found_nets = [n for n in netlist if query in n.upper()]
+            if found_nets:
+                self._show_info_nets(query, found_nets)
+                self.fig.canvas.draw_idle()
+                return
+
+        # 4. Refdes substring match (fallback after net search)
         if not matches:
             matches = [r for r in comps if query in r.upper()]
 
-        # 3. TP refdes — find components connected to this TP
+        # 5. TP refdes — find components connected to this TP
         if not matches:
             tp_match = next((r for r in self._testpoints if r.upper() == query), None)
             if tp_match is None:
@@ -1500,14 +1521,6 @@ class PCBViewer:
                         if r not in seen and r in comps and not is_testpoint(comps[r]):
                             seen.add(r)
                             matches.append(r)
-
-        # 4. Net / signal name — signal-centric panel
-        if not matches:
-            found_nets = [n for n in netlist if query in n.upper()]
-            if found_nets:
-                self._show_info_nets(query, found_nets)
-                self.fig.canvas.draw_idle()
-                return
 
         if not matches:
             self._show_info_none(query)
