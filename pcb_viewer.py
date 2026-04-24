@@ -1054,6 +1054,7 @@ class PCBViewer:
                 if net:
                     self._show_net_connections(net)
                     return
+            self._clear_highlights()
             self._place_board_annot(best_r)
             self._show_info_tp(best_r)
         else:
@@ -1243,20 +1244,26 @@ class PCBViewer:
             return
 
         # ── normal comp/net table mode ────────────────────────────────────
-        best_dist, best_tp     = 0.028, None
-        best_no_tp_net         = None
+        best_dist, best_tp = 0.028, None
+        best_net           = None
+        best_no_tp_net     = None
         for (y_ctr, tp_r, net) in self._info_rows:
             dist = abs(ax_y - y_ctr)
             if dist < best_dist:
                 best_dist = dist
                 if tp_r:
                     best_tp        = tp_r
+                    best_net       = net
                     best_no_tp_net = None
                 else:
                     best_no_tp_net = net
+                    best_net       = net
                     best_tp        = None
 
-        if best_tp:
+        if self._info_mode == 'net' and (best_tp or best_no_tp_net):
+            self._show_net_connections(best_net or best_no_tp_net)
+        elif best_tp:
+            self._clear_highlights()
             self._place_board_annot(best_tp)
             self._pan_to_tp(best_tp)
         elif best_no_tp_net:
@@ -1852,6 +1859,7 @@ class PCBViewer:
 
     def _show_info_nets(self, query: str, nets: list):
         """Signal-centric panel: list all nets matching query with their TPs."""
+        self._clear_highlights()
         self._clear_info()
         self._info_mode      = 'net'
         self._info_net_query = query
