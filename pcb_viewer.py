@@ -965,8 +965,17 @@ class PCBViewer:
         new_left = (event.x - bbox.x0) / bbox.width + 0.008
         self._sidebar_left = max(0.25, min(0.90, new_left))
         self._resize_layout()
-        # Skip table rebuild during drag — axes-fraction text repositions automatically.
-        # One clean redraw fires on mouse release.
+
+        # Refresh table/sidebar content while dragging so truncation updates live.
+        now = time.perf_counter()
+        if now - self._last_table_redraw >= 1 / 30:
+            self._last_table_redraw = now
+            if self._info_mode == 'no_tp_pins' and self._net_conn_current:
+                current_side = 'TOP' if self._view_mode == 'top' else 'BOT'
+                self._draw_net_conn_sidebar(
+                    self._net_conn_current, self._net_conn_points, current_side)
+            elif self._info_mode in ('comp', 'net'):
+                self._redraw_info_table()
         self.fig.canvas.draw_idle()
 
     def _on_release(self, event):
@@ -1690,6 +1699,7 @@ class PCBViewer:
     # ── Search: two-column scrollable table (signal → test point) ────────
     def _show_info_comp(self, refdes: str, comp: dict, tp_map: dict):
         self._clear_info()
+        self._info_mode = 'comp'
 
         # Build net → first matching TP
         net_to_tp: dict = {}
