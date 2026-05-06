@@ -1093,7 +1093,9 @@ class PCBViewer:
     def _max_net_chars(self) -> int:
         """Max chars for net name in table based on current sidebar width."""
         sidebar_w = max(0.08, 1.0 - self._sidebar_left - 0.005)
-        return max(8, int(18 * sidebar_w / 0.350))
+        c2 = self._get_c2()
+        col1_frac = c2 - 0.06   # axes-fraction available to signal text
+        return max(8, int(35 * (sidebar_w / 0.350) * (col1_frac / 0.50)))
 
     def _on_motion(self, event):
         if not self._dragging_sidebar:
@@ -1633,10 +1635,8 @@ class PCBViewer:
 
             if ep['is_tp']:
                 col = self._C_TP_REFDES
-            elif ep['side'] == current_side:
-                col = self._C_PANEL_TEXT
             else:
-                col = self._C_PANEL_SUB
+                col = self._C_PANEL_TEXT
 
             is_origin = (highlight_refdes
                          and ep['refdes'] == highlight_refdes)
