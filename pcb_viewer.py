@@ -401,7 +401,7 @@ class PCBViewer:
         self.ax = self.fig.add_axes([0.005, 0.11, 0.625, 0.835],
                                     facecolor='#0A1018')
         self.ax_info = self.fig.add_axes([0.645, 0.11, 0.35, 0.875],
-                                         facecolor='#F5F7FA')
+                                         facecolor='#FFFFFF')
         self.ax_info.axis('off')
 
         # ── widgets ──────────────────────────────────────────────────────
@@ -631,9 +631,9 @@ class PCBViewer:
         self._clear_info()
         ax = self.ax_info
         ax.text(0.5, 0.6, "Load Error", transform=ax.transAxes,
-                color='#FC8181', fontsize=12, ha='center', fontweight='bold')
+                color='#DC2626', fontsize=12, ha='center', fontweight='bold')
         ax.text(0.5, 0.5, msg, transform=ax.transAxes,
-                color='#FC8181', fontsize=7.5, ha='center',
+                color='#DC2626', fontsize=7.5, ha='center',
                 wrap=True)
 
     # ─── index building ───────────────────────────────────────────────────
@@ -841,18 +841,23 @@ class PCBViewer:
     }
     _COMP_COLOR_DEFAULT = '#B0BEC5'
 
-    # ── Info panel palette (light sidebar) ──────────────────────────────────
-    _C_PANEL_BG   = '#F5F7FA'
-    _C_PANEL_TEXT = '#1A2A3A'
-    _C_PANEL_SUB  = '#4A6A8A'
-    _C_PANEL_HDR  = '#0F3060'
-    _C_PANEL_DIV  = '#C0CDD8'
-    _C_TAG_NET    = '#1A5A9A'
-    _C_TAG_TP     = '#1A7A40'
-    _C_TAG_COMP   = '#8A5A00'
-    _C_LINK       = '#1A5A9A'
-    _C_NET_NAME   = '#2A7A50'
-    _C_TP_REFDES  = '#00688C'
+    # ── Info panel palette — "Clean Pro" (Altium 365 / GitHub style) ────────
+    _C_PANEL_BG   = '#FFFFFF'   # pure white
+    _C_PANEL_TEXT = '#1F2937'   # gray-800  — body text
+    _C_PANEL_SUB  = '#6B7280'   # gray-500  — secondary / metadata
+    _C_PANEL_HDR  = '#111827'   # gray-900  — titles, near-black
+    _C_PANEL_DIV  = '#E5E7EB'   # gray-200  — subtle dividers
+    _C_PANEL_MUTE = '#9CA3AF'   # gray-400  — muted (ellipsis, no-connect)
+    # Semantic
+    _C_TAG_NET    = '#1D4ED8'   # blue-700  — [NET] chip text
+    _C_TAG_NET_BG = '#EFF6FF'   # blue-50   — [NET] chip background
+    _C_TAG_TP     = '#065F46'   # emerald-800 — [TP] chip text
+    _C_TAG_TP_BG  = '#ECFDF5'   # emerald-50  — [TP] chip background
+    _C_TAG_COMP   = '#92400E'   # amber-800 — [COMP] chip text
+    _C_TAG_COMP_BG= '#FFFBEB'   # amber-50  — [COMP] chip background
+    _C_LINK       = '#2563EB'   # blue-600  — clickable endpoints
+    _C_NET_NAME   = '#059669'   # emerald-600 — net with TP
+    _C_TP_REFDES  = '#0284C7'   # sky-600   — TP refdes badge
 
     def _draw_components_bottom(self):
         """Draw BOT components as rectangles + all their pins as one PatchCollection."""
@@ -1363,7 +1368,7 @@ class PCBViewer:
         FM  = ax.transAxes
         y   = 0.96
 
-        def t(text, col='#C0D0E0', sz=10, bold=False, dy=0.046):
+        def t(text, col='#1F2937', sz=10, bold=False, dy=0.046):
             nonlocal y
             ax.text(0.04, y, text, transform=FM, color=col, fontsize=sz,
                     va='top', fontweight='bold' if bold else 'normal',
@@ -1508,35 +1513,35 @@ class PCBViewer:
         DY = 0.042
 
         ax.text(0.03, y, f'Net: "{query}"',
-                transform=FM, color='#AAFFCC', fontsize=12,
+                transform=FM, color=self._C_PANEL_HDR, fontsize=12,
                 va='top', fontweight='bold', fontfamily='monospace')
         y -= 0.048
         ax.text(0.03, y,
                 f'{len(nets)} result(s)  —  click to inspect',
-                transform=FM, color='#6A8EA0', fontsize=9,
+                transform=FM, color=self._C_PANEL_SUB, fontsize=9,
                 va='top', fontfamily='monospace')
         y -= 0.028
-        ax.plot([0, 1], [y, y], color='#1E2A3A', lw=0.7, transform=FM)
+        ax.plot([0, 1], [y, y], color=self._C_PANEL_DIV, lw=0.7, transform=FM)
         y -= 0.016
 
         self._info_rows.clear()
         for net in nets:
             if y < 0.04:
                 ax.text(0.03, y, '  …', transform=FM,
-                        color='#445566', fontsize=9,
+                        color=self._C_PANEL_MUTE, fontsize=9,
                         va='top', fontfamily='monospace')
                 break
             pts   = self._collect_net_points(net)
             n_tp  = sum(1 for p in pts if p['is_tp'])
             n_pin = sum(1 for p in pts if not p['is_tp'])
-            col   = '#3A5048' if is_gnd_net(net) else '#9AE6B4'
+            col   = self._C_PANEL_MUTE if is_gnd_net(net) else self._C_NET_NAME
 
             ax.text(0.03, y, net,
                     transform=FM, color=col, fontsize=10,
                     va='top', fontweight='bold',
                     fontfamily='monospace', clip_on=True)
             ax.text(0.62, y, f'TP:{n_tp}  PIN:{n_pin}',
-                    transform=FM, color='#4A6880', fontsize=9,
+                    transform=FM, color=self._C_PANEL_SUB, fontsize=9,
                     va='top', fontfamily='monospace', clip_on=True)
 
             self._info_rows.append((y - DY * 0.4, net, None))
@@ -1596,7 +1601,7 @@ class PCBViewer:
 
         if not all_points:
             ax.text(0.03, y, 'No endpoints found.',
-                    transform=FM, color='#FC8181', fontsize=10,
+                    transform=FM, color='#DC2626', fontsize=10,
                     va='top', fontfamily='monospace')
             self.fig.canvas.draw_idle()
             return
@@ -1611,7 +1616,7 @@ class PCBViewer:
         for ep in sorted_pts:
             if y < 0.04:
                 ax.text(0.03, y, '  …', transform=FM,
-                        color='#445566', fontsize=9,
+                        color=self._C_PANEL_MUTE, fontsize=9,
                         va='top', fontfamily='monospace')
                 break
 
@@ -1920,7 +1925,7 @@ class PCBViewer:
         FM   = ax.transAxes
         y    = 0.96
 
-        def t(text, col='#C0D0E0', sz=10, bold=False, dy=0.046):
+        def t(text, col='#1F2937', sz=10, bold=False, dy=0.046):
             nonlocal y
             ax.text(0.04, y, text, transform=FM, color=col, fontsize=sz,
                     va='top', fontweight='bold' if bold else 'normal',
@@ -2070,7 +2075,7 @@ class PCBViewer:
                     fontsize=11, va='top', fontweight='bold',
                     fontfamily='monospace')
         y -= DY * 0.8
-        ax.plot([0,1],[y,y], color='#253545', lw=0.5, transform=FM)
+        ax.plot([0,1],[y,y], color=self._C_PANEL_DIV, lw=0.5, transform=FM)
         y -= DY * 0.3
 
         table_top = y
@@ -2185,19 +2190,21 @@ class PCBViewer:
 
         for idx, (score, kind, key) in enumerate(results[:28]):
             if y < 0.04:
-                ax.text(0.03, y, '  …', transform=FM, color='#445566',
+                ax.text(0.03, y, '  …', transform=FM, color=self._C_PANEL_MUTE,
                         fontsize=9, va='top', fontfamily='monospace')
                 break
             if kind == 'net':
-                tag, tag_col = 'NET ', self._C_TAG_NET
+                tag, tag_col, tag_bg = 'NET ', self._C_TAG_NET, self._C_TAG_NET_BG
             elif key in self._testpoints:
-                tag, tag_col = 'TP  ', self._C_TAG_TP
+                tag, tag_col, tag_bg = 'TP  ', self._C_TAG_TP, self._C_TAG_TP_BG
             else:
-                tag, tag_col = 'COMP', self._C_TAG_COMP
-            ax.text(0.03, y, f'[{tag}]', transform=FM, color=tag_col,
-                    fontsize=10, va='top', fontfamily='monospace', clip_on=True,
-                    fontweight='bold')
-            ax.text(0.22, y, key, transform=FM, color=tag_col,
+                tag, tag_col, tag_bg = 'COMP', self._C_TAG_COMP, self._C_TAG_COMP_BG
+            ax.text(0.03, y, f' {tag} ', transform=FM, color=tag_col,
+                    fontsize=9, va='top', fontfamily='monospace', clip_on=True,
+                    fontweight='bold',
+                    bbox=dict(boxstyle='round,pad=0.15', facecolor=tag_bg,
+                              edgecolor='none', alpha=1.0))
+            ax.text(0.22, y, key, transform=FM, color=self._C_PANEL_TEXT,
                     fontsize=9, va='top', fontfamily='monospace', clip_on=True)
             self._info_rows.append((y - DY * 0.4, idx, None))
             y -= DY
@@ -2230,7 +2237,7 @@ class PCBViewer:
         self._clear_info()
         self.ax_info.text(0.5, 0.55, f'Not found: "{query}"',
                           transform=self.ax_info.transAxes,
-                          color='#FC8181', fontsize=14, ha='center')
+                          color='#DC2626', fontsize=14, ha='center')
 
 
 # ─── Entry point ─────────────────────────────────────────────────────────────
