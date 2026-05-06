@@ -2130,12 +2130,16 @@ class PCBViewer:
                     fontfamily='monospace', clip_on=True)
 
             if has_tp:
-                tp_col = _tp_color(tp_r)
+                r_up = tp_r.upper()
+                if r_up.startswith('TPA') or r_up.startswith('TP'):
+                    badge_txt, badge_bg = self._C_TP_REFDES, self._C_TAG_NET_BG
+                else:
+                    badge_txt, badge_bg = '#B45309', self._C_TAG_COMP_BG
                 ax.text(C2, y, tp_r,
-                        transform=FM, color=tp_col, fontsize=11, va='top',
+                        transform=FM, color=badge_txt, fontsize=11, va='top',
                         fontweight='bold', fontfamily='monospace', clip_on=True,
-                        bbox=dict(boxstyle='round,pad=0.10', facecolor='#E8F4FE',
-                                  edgecolor=tp_col, alpha=0.9, linewidth=0.5))
+                        bbox=dict(boxstyle='round,pad=0.10', facecolor=badge_bg,
+                                  edgecolor=badge_txt, alpha=1.0, linewidth=0.7))
             else:
                 ax.text(C2, y, '\u2014',
                         transform=FM, color=self._C_PANEL_SUB, fontsize=11, va='top',
