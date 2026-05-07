@@ -1629,7 +1629,7 @@ class PCBViewer:
                 grp       = ep['side']
                 is_active = (grp == current_side)
                 marker    = '●' if is_active else '○'
-                grp_col   = self._C_NET_NAME if is_active else self._C_PANEL_SUB
+                grp_col   = self._C_NET_NAME if is_active else self._C_PANEL_TEXT
                 ax.text(0.03, y, f'{marker} {grp}',
                         transform=FM, color=grp_col, fontsize=8,
                         va='top', fontfamily='monospace', style='italic')
@@ -1655,7 +1655,7 @@ class PCBViewer:
                     fontweight='bold' if is_origin else 'normal',
                     fontfamily='monospace', clip_on=True)
 
-            badge_col = self._C_NET_NAME if ep['side'] == current_side else self._C_PANEL_SUB
+            badge_col = self._C_NET_NAME if ep['side'] == current_side else self._C_PANEL_TEXT
             ax.text(0.72, y, f"[{ep['side']}]",
                     transform=FM, color=badge_col, fontsize=8,
                     va='top', fontfamily='monospace', clip_on=True)
