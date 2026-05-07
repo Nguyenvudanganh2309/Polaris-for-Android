@@ -400,6 +400,12 @@ class PCBViewer:
 
         self.ax = self.fig.add_axes([0.005, 0.11, 0.625, 0.835],
                                     facecolor='#0A1018')
+        self._crosshair_h = self.ax.axhline(
+            y=0, color='white', alpha=0.28, linewidth=0.75,
+            linestyle=(0, (7, 7)), zorder=15, visible=False)
+        self._crosshair_v = self.ax.axvline(
+            x=0, color='white', alpha=0.28, linewidth=0.75,
+            linestyle=(0, (7, 7)), zorder=15, visible=False)
         self.ax_info = self.fig.add_axes([0.645, 0.11, 0.35, 0.875],
                                          facecolor='#FFFFFF')
         self.ax_info.axis('off')
@@ -761,13 +767,21 @@ class PCBViewer:
     def _pad_geom(self, pad_stack: str, side: str = 'TOP'):
         """Get pad geometry for a pad-stack on the requested board side."""
         by_layer = self._pad_defs.get(pad_stack, {}) if isinstance(self._pad_defs, dict) else {}
+        if not by_layer:
+            return None
         side_u = (side or 'TOP').upper()
-        pref = 'TOP' if side_u == 'TOP' else 'BOTTOM'
-        geom = by_layer.get(pref)
-        if geom:
-            return geom
-        # fallback when one side missing in file
-        return by_layer.get('TOP') or by_layer.get('BOTTOM') or None
+        # Try canonical names, then common Fabmaster abbreviations for this side
+        pref_names = ('TOP',) if side_u == 'TOP' else ('BOTTOM', 'BOT')
+        for name in pref_names:
+            geom = by_layer.get(name)
+            if geom:
+                return geom
+        # Fallback: any known layer key (handles non-standard naming)
+        for name in ('TOP', 'BOTTOM', 'BOT'):
+            geom = by_layer.get(name)
+            if geom:
+                return geom
+        return next(iter(by_layer.values()), None)
 
     def _make_pad_patch(self, pin_x: float, pin_y: float, pad_stack: str,
                         pin_rotation: float = 0.0, side: str = 'TOP',
@@ -1102,16 +1116,28 @@ class PCBViewer:
         return max(8, int(35 * (sidebar_w / 0.350) * (col1_frac / 0.50)))
 
     def _on_motion(self, event):
-        if not self._dragging_sidebar:
-            return
-        if event.x is None:
+        # ── crosshair ─────────────────────────────────────────────────────────
+        on_board = (event.inaxes == self.ax
+                    and event.xdata is not None and event.ydata is not None)
+        if on_board:
+            self._crosshair_h.set_ydata([event.ydata, event.ydata])
+            self._crosshair_v.set_xdata([event.xdata, event.xdata])
+            self._crosshair_h.set_visible(True)
+            self._crosshair_v.set_visible(True)
+            self.fig.canvas.draw_idle()
+        elif self._crosshair_h.get_visible():
+            self._crosshair_h.set_visible(False)
+            self._crosshair_v.set_visible(False)
+            self.fig.canvas.draw_idle()
+
+        # ── sidebar drag ──────────────────────────────────────────────────────
+        if not self._dragging_sidebar or event.x is None:
             return
         bbox = self.fig.bbox
         new_left = (event.x - bbox.x0) / bbox.width + 0.008
         self._sidebar_left = max(0.25, min(0.90, new_left))
         self._resize_layout()
 
-        # Refresh table/sidebar content while dragging so truncation updates live.
         now = time.perf_counter()
         if now - self._last_table_redraw >= 1 / 30:
             self._last_table_redraw = now
