@@ -1,14 +1,14 @@
 """
 PCB Layout Viewer – Fabmaster (.txt) format  v3
 ================================================
-* Board outline (SIP shape) với lines + arcs
-* Test points (TP / TPA / PPA …) vẽ bằng Circle patch data-coords
-  → tự động scale khi zoom in/out
-* Không hiện label mặc định – chỉ hiện khi:
-    - Click chuột trái vào test point
-    - Search linh kiện và test point được highlight
-* Khi search: bỏ qua các test point chỉ kết nối qua GND
-* Click vào vùng trống để bỏ label
+* Board outline with lines + arcs
+* Test points (TP / TPA / PPA …) drawn as Circle patches in data-coords
+  → scale automatically on zoom
+* Labels hidden by default – shown only when:
+    - Left-clicking a test point
+    - Searching a component / test point (highlighted)
+* Search: ignores test points connected only through GND nets
+* Click on empty board area to clear label
 
 Usage
 -----
@@ -18,6 +18,7 @@ Usage
 
 import math
 import sys
+import time
 from pathlib import Path
 from collections import defaultdict
 
@@ -25,7 +26,7 @@ import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from matplotlib.patches import Circle
+from matplotlib.patches import Circle, Ellipse
 from matplotlib.collections import PatchCollection, PolyCollection
 from matplotlib.widgets import TextBox, Button
 import numpy as np
@@ -55,6 +56,7 @@ def parse_fabmaster(filepath: str) -> dict:
     comp_nets        = defaultdict(list)
     outline: list    = []
     pad_sizes: dict  = {}   # pad_stack_name -> diameter (mm)
+    pad_defs: dict   = defaultdict(dict)   # pad_stack_name -> layer -> pad geometry
     tp_pad_map: dict = {}   # refdes -> pad_stack_name
     # raw outline coords collected from GRAPHIC_DATA assembly lines
     _assy_xs: dict   = defaultdict(list)   # refdes -> [x, ...]
@@ -97,15 +99,46 @@ def parse_fabmaster(filepath: str) -> dict:
             comp_nets[refdes].append((net, parts[3], parts[4]))
 
         elif mode == 'pad' and len(parts) >= 9:
-            pad_name = parts[1]; layer = parts[3]; shape = parts[6]
-            if layer == 'TOP' and shape and shape != '0.0000':
-                try:
-                    w = float(parts[7]); h = float(parts[8])
-                    d = (w + h) / 2
-                    if pad_name not in pad_sizes or d > pad_sizes[pad_name]:
-                        pad_sizes[pad_name] = d
-                except ValueError:
-                    pass
+            pad_name = parts[1]
+            layer = parts[3].strip().upper()
+
+            # Support both header variants:
+            # 1) ...!LAYER!PADSHAPE1!PADWIDTH!PADHGHT!PADXOFF!PADYOFF!PADSHAPENAME...
+            # 2) ...!LAYER!FIXFLAG!VIAFLAG!PADSHAPE1!PADWIDTH!PADHGHT!PADXOFF!PADYOFF...
+            shape_i, w_i, h_i, xo_i, yo_i, shapename_i = 4, 5, 6, 7, 8, 9
+            if len(parts) > 10:
+                cand = parts[4].strip().upper()
+                if cand not in {
+                    '', 'RECTANGLE', 'ROUNDED_RECT', 'OBLONG_X', 'OBLONG_Y',
+                    'CIRCLE', 'SQUARE', 'CHAMFERED_RECT', 'SHAPE'
+                }:
+                    shape_i, w_i, h_i, xo_i, yo_i, shapename_i = 6, 7, 8, 9, 10, 11
+
+            shape = parts[shape_i].strip().upper() if len(parts) > shape_i else ''
+            if not shape or shape == '0.0000':
+                continue
+            try:
+                w = float(parts[w_i]) if len(parts) > w_i and parts[w_i] else 0.0
+                h = float(parts[h_i]) if len(parts) > h_i and parts[h_i] else w
+                xoff = float(parts[xo_i]) if len(parts) > xo_i and parts[xo_i] else 0.0
+                yoff = float(parts[yo_i]) if len(parts) > yo_i and parts[yo_i] else 0.0
+            except ValueError:
+                continue
+
+            pad_defs[pad_name][layer] = dict(
+                shape=shape,
+                width=max(0.0, w),
+                height=max(0.0, h),
+                xoff=xoff,
+                yoff=yoff,
+                pad_shape_name=(parts[shapename_i].strip()
+                                if len(parts) > shapename_i else ''),
+            )
+
+            if layer == 'TOP':
+                d = (w + h) / 2 if (w > 0 and h > 0) else max(w, h)
+                if d > 0 and (pad_name not in pad_sizes or d > pad_sizes[pad_name]):
+                    pad_sizes[pad_name] = d
 
         elif mode == 'pin' and len(parts) >= 8:
             # A!SYM_NAME!PIN_NAME!PIN_NUMBER!PIN_X!PIN_Y!PAD_STACK_NAME!REFDES
@@ -118,6 +151,8 @@ def parse_fabmaster(filepath: str) -> dict:
                     parts[2],                            # pin name
                     parts[3],                            # pin number
                     pad_stack,
+                    float(parts[8]) if len(parts) > 8 and parts[8] else 0.0,  # pin rotation
+                    (parts[9].strip().upper() == 'YES') if len(parts) > 9 else False,
                 ))
             except (ValueError, IndexError):
                 pass
@@ -165,7 +200,8 @@ def parse_fabmaster(filepath: str) -> dict:
 
     return dict(components=components, netlist=netlist,
                 comp_nets=comp_nets, outline=outline,
-                pad_sizes=pad_sizes, tp_pad_map=tp_pad_map,
+                pad_sizes=pad_sizes, pad_defs={k: dict(v) for k, v in pad_defs.items()},
+                tp_pad_map=tp_pad_map,
                 comp_bounds=comp_bounds,
                 comp_pins=dict(comp_pins))
 
@@ -354,6 +390,7 @@ class PCBViewer:
         self._comp_to_tps      = defaultdict(lambda: defaultdict(list))
         self._tp_order: list   = []
         self._pad_sizes        = data.get('pad_sizes', {})
+        self._pad_defs         = data.get('pad_defs', {})
         self._tp_pad_map       = data.get('tp_pad_map', {})
         self._build_indices()
 
@@ -363,9 +400,19 @@ class PCBViewer:
 
         self.ax = self.fig.add_axes([0.005, 0.11, 0.625, 0.835],
                                     facecolor='#0A1018')
+        self._crosshair_h = self.ax.axhline(
+            y=0, color='white', alpha=0.28, linewidth=0.75,
+            linestyle=(0, (7, 7)), zorder=15, visible=False)
+        self._crosshair_v = self.ax.axvline(
+            x=0, color='white', alpha=0.28, linewidth=0.75,
+            linestyle=(0, (7, 7)), zorder=15, visible=False)
         self.ax_info = self.fig.add_axes([0.645, 0.11, 0.35, 0.875],
-                                         facecolor='#0A1018')
+                                         facecolor='#FFFFFF')
         self.ax_info.axis('off')
+        self.ax_info.set_xlim(0, 1); self.ax_info.set_ylim(0, 1)
+        self.ax_info.add_patch(mpatches.Rectangle(
+            (0, 0), 1, 1, transform=self.ax_info.transAxes,
+            facecolor=self._C_PANEL_BG, edgecolor='none', zorder=-1))
 
         # ── widgets ──────────────────────────────────────────────────────
         ax_open   = self.fig.add_axes([0.005, 0.952, 0.13,  0.038])
@@ -373,7 +420,6 @@ class PCBViewer:
         ax_bottom = self.fig.add_axes([0.230, 0.952, 0.085, 0.038])
         ax_tb   = self.fig.add_axes([0.005, 0.020, 0.42, 0.066])
         ax_btn  = self.fig.add_axes([0.430, 0.020, 0.09, 0.066])
-        ax_clr  = self.fig.add_axes([0.526, 0.020, 0.07, 0.066])
 
         self.textbox = TextBox(ax_tb, 'Search: ', initial='',
                                color="#E5E5F1", hovercolor="#E8E8F3",
@@ -383,30 +429,17 @@ class PCBViewer:
         self.textbox.text_disp.set_fontsize(10)
 
         self.btn_find   = Button(ax_btn,    'Find',      color='#0F3460', hovercolor='#1E5C9E')
-        self.btn_clear  = Button(ax_clr,    'Clear',     color='#2A2A50', hovercolor='#44447A')
         self.btn_open   = Button(ax_open,   'Open File', color='#1A3A1A', hovercolor='#2A5A2A')
         self.btn_top    = Button(ax_top,    'TOP',       color='#1A2A3A', hovercolor='#2A4A6A')
         self.btn_bottom = Button(ax_bottom, 'BOTTOM',    color='#2A1A3A', hovercolor='#4A2A6A')
-        for b in (self.btn_find, self.btn_clear, self.btn_open,
-                  self.btn_top, self.btn_bottom):
+        for b in (self.btn_find, self.btn_open, self.btn_top, self.btn_bottom):
             b.label.set_color('white'); b.label.set_fontsize(9)
 
         self.btn_find.on_clicked(self._on_search)
-        self.btn_clear.on_clicked(self._on_clear)
         self.btn_open.on_clicked(self._on_open_file)
         self.btn_top.on_clicked(self._on_top_view)
         self.btn_bottom.on_clicked(self._on_bottom_view)
         self.textbox.on_submit(self._on_search)
-
-        # ── panel filter textbox (right side, below info panel) ──────────
-        ax_filter = self.fig.add_axes([0.645, 0.020, 0.305, 0.066])
-        self.filter_box = TextBox(ax_filter, 'Filter: ', initial='',
-                                  color="#F4F7F5", hovercolor="#F7F9F6",
-                                  label_pad=0.04)
-        self.filter_box.label.set_color("#2AD3AB")
-        self.filter_box.text_disp.set_color("#000000")
-        self.filter_box.text_disp.set_fontsize(9)
-        self.filter_box.on_submit(self._on_filter)
 
         # ── state ────────────────────────────────────────────────────────
         self._highlights: list   = []
@@ -418,9 +451,10 @@ class PCBViewer:
         self._info_scroll        = 0
         self._info_visible       = 30
         self._current_comp       = None
-        self._panel_filter       = ''    # current filter string
-        self._info_mode          = 'idle'  # 'idle' | 'comp' | 'net' | 'tp'
+        self._info_mode          = 'idle'  # 'idle' | 'comp' | 'net_list' | 'net_detail' | 'tp'
         self._info_net_query     = ''
+        self._search_results: list = []    # ranked search candidates
+        self._selected_result_idx = 0
         self._view_mode          = 'top'   # 'top' | 'bottom'
         self._project_data       = data    # the one loaded file — used for both views
         self._project_dir        = str(Path(data.get('_filepath', __file__)).parent)
@@ -429,6 +463,18 @@ class PCBViewer:
         self._bottom_comps       = []
         self._comp_labels        = []
         self._bot_pin_data       = []
+        self._net_conn_current   = ''      # net name being shown in net-connection sidebar
+        self._net_conn_points: list = []   # cached all_points from last _show_net_connections
+        self._net_list_nets:  list = []   # danh sách net trong mode net_list
+        self._net_list_query: str  = ''   # query đang hiển thị trong net_list
+        self._last_table_redraw  = 0.0     # perf_counter timestamp of last _redraw_info_table
+
+        # Sidebar resize state
+        self._sidebar_left      = 0.645   # figure fraction where info panel starts
+        self._dragging_sidebar  = False
+        self._divider_line      = None
+        self._no_tp_pin_rows: list = []   # (y_ctr, refdes, pin_num, px, py, side, is_tp, pad_stack, pin_rot)
+        self._TP_COL_FIG_W      = 0.42 * 0.350  # fixed TP column width in figure fractions
 
         # ── draw ─────────────────────────────────────────────────────────
         self._draw_board()
@@ -441,6 +487,18 @@ class PCBViewer:
         # ── events ───────────────────────────────────────────────────────
         self.fig.canvas.mpl_connect('button_press_event', self._on_click)
         self.fig.canvas.mpl_connect('scroll_event',       self._on_scroll)
+        self.fig.canvas.mpl_connect('key_press_event',    self._on_key_press)
+
+        # Draw resizable divider between board and sidebar
+        from matplotlib.lines import Line2D as _Line2D
+        self._divider_line = _Line2D(
+            [self._sidebar_left - 0.008, self._sidebar_left - 0.008], [0.09, 1.0],
+            transform=self.fig.transFigure, figure=self.fig,
+            color='#2A4060', linewidth=2.5, zorder=50, solid_capstyle='round')
+        self.fig.add_artist(self._divider_line)
+
+        self.fig.canvas.mpl_connect('motion_notify_event',  self._on_motion)
+        self.fig.canvas.mpl_connect('button_release_event', self._on_release)
 
         # Drag & drop (TkAgg only)
         try:
@@ -490,6 +548,7 @@ class PCBViewer:
 
         self.data         = data
         self._pad_sizes   = data.get('pad_sizes', {})
+        self._pad_defs    = data.get('pad_defs', {})
         self._tp_pad_map  = data.get('tp_pad_map', {})
         self._testpoints  = {}
         self._tp_net      = {}
@@ -548,8 +607,10 @@ class PCBViewer:
 
     def _switch_data(self, data: dict):
         """Rebuild indices and redraw the board with the given data dict."""
+        saved_net = self._net_conn_current
         self.data         = data
         self._pad_sizes   = data.get('pad_sizes', {})
+        self._pad_defs    = data.get('pad_defs', {})
         self._tp_pad_map  = data.get('tp_pad_map', {})
         self._testpoints  = {}
         self._tp_net      = {}
@@ -557,6 +618,7 @@ class PCBViewer:
         self._comp_to_tps = defaultdict(lambda: defaultdict(list))
         self._tp_order    = []
         self._build_indices()
+        self._comp_label_map = {}   # cla() removes artists; reset reference
         self._clear_highlights()
         self.ax.cla()
         self._tp_collection  = None   # cla() removed it from axes; reset reference
@@ -571,15 +633,17 @@ class PCBViewer:
         self._auto_zoom()
         self._draw_legend()
         self._show_idle_info()
+        if saved_net:
+            self._on_net_selected(saved_net)
         self.fig.canvas.draw_idle()
 
     def _show_info_error(self, msg: str):
         self._clear_info()
         ax = self.ax_info
         ax.text(0.5, 0.6, "Load Error", transform=ax.transAxes,
-                color='#FC8181', fontsize=12, ha='center', fontweight='bold')
+                color='#DC2626', fontsize=12, ha='center', fontweight='bold')
         ax.text(0.5, 0.5, msg, transform=ax.transAxes,
-                color='#FC8181', fontsize=7.5, ha='center',
+                color='#DC2626', fontsize=7.5, ha='center',
                 wrap=True)
 
     # ─── index building ───────────────────────────────────────────────────
@@ -609,10 +673,155 @@ class PCBViewer:
                 for tp in tp_by_net.get(net, []):
                     self._comp_to_tps[refdes][tp].append((net, pin_n, pin_nm))
 
+        # Cache click tolerance (max TP pad radius × 3) so _handle_board_click
+        # doesn't recompute it on every click.
+        self._tp_click_tol = (
+            max(self._r(c) * 3.0 for _, c in self._tp_order)
+            if self._tp_order else 1.0
+        )
+
+    def _collect_net_points(self, net: str) -> list:
+        """
+        Trả về list tất cả endpoint đo được của net.
+        """
+        results    = []
+        netlist    = self.data.get('netlist', {})
+        comp_pins  = self.data.get('comp_pins', {})
+        components = self.data['components']
+
+        for refdes, pn, pnm in netlist.get(net, []):
+            comp = components.get(refdes)
+            if not comp:
+                continue
+            is_tp = is_testpoint(comp)
+
+            if is_tp:
+                tp = self._testpoints.get(refdes)
+                if not tp:
+                    continue
+                pad_stack = self._tp_pad_map.get(refdes, '')
+                by_layer  = self._pad_defs.get(pad_stack, {})
+                has_top   = ('TOP' in by_layer and by_layer['TOP'].get('width', 0) > 0)
+                has_bot   = ('BOTTOM' in by_layer and by_layer['BOTTOM'].get('width', 0) > 0)
+
+                base = dict(
+                    label=refdes, refdes=refdes,
+                    pin_number=str(pn), pin_name=str(pnm),
+                    px=tp['x'], py=tp['y'],
+                    is_tp=True, pad_stack=pad_stack,
+                    pin_rot=comp.get('rotate', 0.0),
+                )
+                if has_top:
+                    results.append({**base, 'side': 'TOP'})
+                if has_bot:
+                    results.append({**base, 'side': 'BOT'})
+                if not has_top and not has_bot:
+                    results.append({**base, 'side': comp.get('side', 'TOP')})
+
+            else:
+                matched = None
+                for (px, py, pin_name, pin_number,
+                     pad_stack, pin_rot, _) in comp_pins.get(refdes, []):
+                    if str(pin_number) == str(pn):
+                        matched = (px, py, pin_name, pin_number, pad_stack, pin_rot)
+                        break
+                if not matched:
+                    continue
+                px, py, pin_name, pin_number, pad_stack, pin_rot = matched
+                results.append(dict(
+                    label=f'{refdes}.{pn}',
+                    refdes=refdes,
+                    pin_number=str(pn),
+                    pin_name=pin_name,
+                    px=px, py=py,
+                    side=comp.get('side', 'TOP'),
+                    is_tp=False,
+                    pad_stack=pad_stack,
+                    pin_rot=pin_rot,
+                ))
+
+        results.sort(key=lambda e: (0 if e['is_tp'] else 1, e['label']))
+        return results
+
     # ─── drawing ──────────────────────────────────────────────────────────
 
     def _r(self, comp):
         return _tp_radius(comp, self._pad_sizes, self._tp_pad_map)
+
+    @staticmethod
+    def _rotate_offset(xoff: float, yoff: float, deg: float):
+        th = math.radians(deg)
+        return (
+            xoff * math.cos(th) - yoff * math.sin(th),
+            xoff * math.sin(th) + yoff * math.cos(th),
+        )
+
+    @staticmethod
+    def _rotated_rect_points(cx: float, cy: float, w: float, h: float, deg: float):
+        hw, hh = w / 2.0, h / 2.0
+        pts = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)]
+        th = math.radians(deg)
+        ct, st = math.cos(th), math.sin(th)
+        return [(cx + x * ct - y * st, cy + x * st + y * ct) for x, y in pts]
+
+    def _pad_geom(self, pad_stack: str, side: str = 'TOP'):
+        """Get pad geometry for a pad-stack on the requested board side."""
+        by_layer = self._pad_defs.get(pad_stack, {}) if isinstance(self._pad_defs, dict) else {}
+        if not by_layer:
+            return None
+        side_u = (side or 'TOP').upper()
+        # Try canonical names, then common Fabmaster abbreviations for this side
+        pref_names = ('TOP',) if side_u == 'TOP' else ('BOTTOM', 'BOT')
+        for name in pref_names:
+            geom = by_layer.get(name)
+            if geom:
+                return geom
+        # Fallback: any known layer key (handles non-standard naming)
+        for name in ('TOP', 'BOTTOM', 'BOT'):
+            geom = by_layer.get(name)
+            if geom:
+                return geom
+        return next(iter(by_layer.values()), None)
+
+    def _make_pad_patch(self, pin_x: float, pin_y: float, pad_stack: str,
+                        pin_rotation: float = 0.0, side: str = 'TOP',
+                        *, fill=True, edgecolor='#111111', facecolor='none',
+                        linewidth=0.7, zorder=7, alpha=0.9, scale: float = 1.0):
+        """Create a pad patch using PADSHAPE/PADWIDTH/PADHGHT/PADXOFF/PADYOFF."""
+        geom = self._pad_geom(pad_stack, side)
+        if not geom:
+            r = max(0.045, self._pad_sizes.get(pad_stack, 0.0) * 0.5) * scale
+            return Circle((pin_x, pin_y), r, fill=fill, edgecolor=edgecolor,
+                          facecolor=facecolor, linewidth=linewidth, zorder=zorder, alpha=alpha)
+
+        shape = (geom.get('shape') or '').upper()
+        w = max(0.001, float(geom.get('width', 0.0) or 0.0)) * scale
+        h = max(0.001, float(geom.get('height', 0.0) or 0.0)) * scale
+        xoff = float(geom.get('xoff', 0.0) or 0.0)
+        yoff = float(geom.get('yoff', 0.0) or 0.0)
+        rox, roy = self._rotate_offset(xoff, yoff, pin_rotation)
+        cx, cy = pin_x + rox, pin_y + roy
+
+        common = dict(fill=fill, edgecolor=edgecolor, facecolor=facecolor,
+                      linewidth=linewidth, zorder=zorder, alpha=alpha)
+
+        if shape in ('CIRCLE',):
+            r = max(w, h) / 2.0
+            return Circle((cx, cy), r, **common)
+        if shape in ('OBLONG_X', 'OBLONG_Y'):
+            rot = pin_rotation + (90.0 if shape == 'OBLONG_Y' else 0.0)
+            return Ellipse((cx, cy), width=max(w, 0.001), height=max(h, 0.001),
+                           angle=rot, **common)
+        if shape in ('RECTANGLE', 'ROUNDED_RECT', 'CHAMFERED_RECT', 'SQUARE', 'SHAPE'):
+            if shape == 'SQUARE':
+                s = max(w, h)
+                w = h = s
+            pts = self._rotated_rect_points(cx, cy, w, h, pin_rotation)
+            return mpatches.Polygon(pts, closed=True, **common)
+
+        # Unknown pad shape: draw ellipse fallback
+        return Ellipse((cx, cy), width=max(w, 0.001), height=max(h, 0.001),
+                       angle=pin_rotation, **common)
 
     def _draw_board(self):
         ax = self.ax
@@ -627,7 +836,7 @@ class PCBViewer:
         ax.set_title(self.title, color='#B0C4D8', fontsize=10, pad=5)
         ax.tick_params(colors='#445060', labelsize=7)
         for sp in ax.spines.values(): sp.set_edgecolor('#202838')
-        ax.set_aspect('equal')
+        ax.set_aspect('equal', adjustable='datalim')
         ax.grid(True, color='#101820', lw=0.35, linestyle='--', zorder=0)
 
     def _draw_components(self):
@@ -650,6 +859,24 @@ class PCBViewer:
     }
     _COMP_COLOR_DEFAULT = '#B0BEC5'
 
+    # ── Info panel palette — "Clean Pro" (Altium 365 / GitHub style) ────────
+    _C_PANEL_BG   = '#FFFFFF'   # pure white
+    _C_PANEL_TEXT = '#1F2937'   # gray-800  — body text
+    _C_PANEL_SUB  = '#6B7280'   # gray-500  — secondary / metadata
+    _C_PANEL_HDR  = '#111827'   # gray-900  — titles, near-black
+    _C_PANEL_DIV  = '#E5E7EB'   # gray-200  — subtle dividers
+    _C_PANEL_MUTE = '#9CA3AF'   # gray-400  — muted (ellipsis, no-connect)
+    # Semantic
+    _C_TAG_NET    = '#1D4ED8'   # blue-700  — [NET] chip text
+    _C_TAG_NET_BG = '#EFF6FF'   # blue-50   — [NET] chip background
+    _C_TAG_TP     = '#065F46'   # emerald-800 — [TP] chip text
+    _C_TAG_TP_BG  = '#ECFDF5'   # emerald-50  — [TP] chip background
+    _C_TAG_COMP   = '#92400E'   # amber-800 — [COMP] chip text
+    _C_TAG_COMP_BG= '#FFFBEB'   # amber-50  — [COMP] chip background
+    _C_LINK       = '#2563EB'   # blue-600  — clickable endpoints
+    _C_NET_NAME   = '#059669'   # emerald-600 — net with TP
+    _C_TP_REFDES  = '#0284C7'   # sky-600   — TP refdes badge
+
     def _draw_components_bottom(self):
         """Draw BOT components as rectangles + all their pins as one PatchCollection."""
         comps = [(r, c) for r, c in self.data['components'].items()
@@ -660,7 +887,6 @@ class PCBViewer:
         self._bottom_comps = comps
         bounds    = self.data.get('comp_bounds', {})
         comp_pins = self.data.get('comp_pins', {})
-        pad_sizes = self._pad_sizes
 
         # ── component rectangles ─────────────────────────────────────────────
         verts, rect_colors = [], []
@@ -679,24 +905,23 @@ class PCBViewer:
                              linewidths=0.5, alpha=0.80, zorder=4, clip_on=True)
         self.ax.add_collection(col)
 
-        # ── pin circles (data-coords → auto-scales with zoom) ───────────────
-        DEFAULT_R   = 0.045   # mm fallback
+        # ── pin shapes from pad-stack definitions ────────────────────────────
         pin_patches = []
         pin_colors  = []
-        self._bot_pin_data = []  # (refdes, pin_x, pin_y, pin_name, pin_number, pad_stack)
+        self._bot_pin_data = []  # (refdes, pin_x, pin_y, pin_name, pin_number, pad_stack, pin_rot)
 
         bot_refdes_set = {r for r, _ in comps}
         for refdes, pins in comp_pins.items():
             if refdes not in bot_refdes_set:
                 continue
-            for pin_x, pin_y, pin_name, pin_number, pad_stack in pins:
-                r = pad_sizes.get(pad_stack, 0) / 2
-                if r <= 0:
-                    r = DEFAULT_R
-                pin_patches.append(Circle((pin_x, pin_y), r))
+            for pin_x, pin_y, pin_name, pin_number, pad_stack, pin_rot, _tp in pins:
+                pin_patches.append(self._make_pad_patch(
+                    pin_x, pin_y, pad_stack, pin_rot, 'BOTTOM',
+                    fill=True, facecolor='#22AAFF', edgecolor='#004488',
+                    linewidth=0.2, zorder=7, alpha=0.88))
                 pin_colors.append('#22AAFF')
                 self._bot_pin_data.append(
-                    (refdes, pin_x, pin_y, pin_name, pin_number, pad_stack))
+                    (refdes, pin_x, pin_y, pin_name, pin_number, pad_stack, pin_rot))
 
         if pin_patches:
             self._pin_collection = PatchCollection(
@@ -704,41 +929,40 @@ class PCBViewer:
                 linewidths=0.2, alpha=0.88, zorder=7, clip_on=True)
             self.ax.add_collection(self._pin_collection)
 
-        self._comp_labels = []   # labels drawn lazily on zoom
-
-    def _refresh_bottom_labels(self):
-        """Show refdes labels only for components visible in the current viewport.
-        Called after every zoom/pan in BOTTOM mode."""
-        for t in getattr(self, '_comp_labels', []):
-            try: t.remove()
-            except Exception: pass
-        self._comp_labels = []
-
-        comps = getattr(self, '_bottom_comps', [])
-        if not comps:
-            return
-
-        xlim = self.ax.get_xlim()
-        ylim = self.ax.get_ylim()
-        visible = [(r, c) for r, c in comps
-                   if xlim[0] <= c['x'] <= xlim[1] and ylim[0] <= c['y'] <= ylim[1]]
-
-        # Only render labels when few enough components are in view
-        if len(visible) > 80:
-            return
-
-        for refdes, c in visible:
+        # Pre-create all label artists (hidden); toggled by _refresh_bottom_labels
+        self._comp_label_map: dict = {}
+        for refdes, c in comps:
             t = self.ax.text(
                 c['x'], c['y'], refdes,
                 fontsize=7, color='white', ha='center', va='center',
-                fontweight='bold', zorder=6, clip_on=True,
+                fontweight='bold', zorder=6, clip_on=True, visible=False,
                 bbox=dict(boxstyle='round,pad=0.15', facecolor='#000000',
                           alpha=0.55, edgecolor='none'))
-            self._comp_labels.append(t)
+            self._comp_label_map[refdes] = t
+
+    def _refresh_bottom_labels(self):
+        """Toggle label visibility for components in the current viewport.
+        No artists are created or destroyed — only set_visible() is called."""
+        label_map = getattr(self, '_comp_label_map', {})
+        if not label_map:
+            return
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+        comps = getattr(self, '_bottom_comps', [])
+        in_view = [
+            (r, c) for r, c in comps
+            if xlim[0] <= c['x'] <= xlim[1] and ylim[0] <= c['y'] <= ylim[1]
+        ]
+        show_labels = len(in_view) <= 80
+        for refdes, c in comps:
+            artist = label_map.get(refdes)
+            if artist is None:
+                continue
+            in_viewport = xlim[0] <= c['x'] <= xlim[1] and ylim[0] <= c['y'] <= ylim[1]
+            artist.set_visible(show_labels and in_viewport)
 
     def _refresh_bottom_pins(self):
-        """Draw pad circles (data-coords) for BOT components visible in viewport.
-        Called on every scroll/zoom so pins scale naturally with the board."""
+        """Draw BOT pad shapes (data-coords) for components visible in viewport."""
         if self._pin_collection is not None:
             try: self._pin_collection.remove()
             except Exception: pass
@@ -748,7 +972,6 @@ class PCBViewer:
             return
 
         comp_pins = self.data.get('comp_pins', {})
-        pad_sizes = self._pad_sizes
         xlim = self.ax.get_xlim()
         ylim = self.ax.get_ylim()
 
@@ -758,14 +981,13 @@ class PCBViewer:
         if len(visible) > 30:
             return
 
-        DEFAULT_R = 0.045   # mm fallback radius
         patches, colors = [], []
         for refdes, _ in visible:
-            for pin_x, pin_y, _, pad_stack in comp_pins.get(refdes, []):
-                r = pad_sizes.get(pad_stack, 0) / 2
-                if r <= 0:
-                    r = DEFAULT_R
-                patches.append(Circle((pin_x, pin_y), r))
+            for pin_x, pin_y, _pnm, _pnn, pad_stack, pin_rot, _tp in comp_pins.get(refdes, []):
+                patches.append(self._make_pad_patch(
+                    pin_x, pin_y, pad_stack, pin_rot, 'BOTTOM',
+                    fill=True, facecolor='#22AAFF', edgecolor='#004488',
+                    linewidth=0.2, zorder=7, alpha=0.88))
                 colors.append('#22AAFF')
 
         if patches:
@@ -777,7 +999,12 @@ class PCBViewer:
     def _draw_testpoints(self):
         patches, fc, ec = [], [], []
         for refdes, c in self._tp_order:
-            patches.append(Circle((c['x'], c['y']), self._r(c)))
+            pad_stack = self._tp_pad_map.get(refdes, '')
+            side = c.get('side', 'TOP')
+            patches.append(self._make_pad_patch(
+                c['x'], c['y'], pad_stack, c.get('rotate', 0.0), side,
+                fill=True, facecolor=_tp_color(refdes), edgecolor='#111111',
+                linewidth=0.7, zorder=5, alpha=0.90))
             fc.append(_tp_color(refdes))
             ec.append('#111111')
         self._tp_collection = PatchCollection(
@@ -826,25 +1053,6 @@ class PCBViewer:
 
     # ─── scroll handler ───────────────────────────────────────────────────
 
-    def _on_filter(self, text=None):
-        """Filter signal rows in the info panel by signal or TP name."""
-        self._panel_filter = (text if isinstance(text, str)
-                              else self.filter_box.text).strip().upper()
-        self._info_scroll = 0
-        self._redraw_info_table()
-        self.fig.canvas.draw_idle()
-
-    def _filtered_rows(self):
-        """Return self._all_info_rows filtered by self._panel_filter."""
-        q = self._panel_filter
-        if not q:
-            return self._all_info_rows
-        return [
-            row for row in self._all_info_rows
-            if q in row[0].upper()                          # net name
-            or (row[3] and q in row[3].upper())            # TP refdes
-        ]
-
     def _on_scroll(self, event):
         if event.inaxes == self.ax:
             # ── zoom board centered on cursor ─────────────────────────────
@@ -860,13 +1068,106 @@ class PCBViewer:
             self.fig.canvas.draw_idle()
 
         elif event.inaxes == self.ax_info:
-            # ── scroll info table ─────────────────────────────────────────
+            # ── scroll info table — rate-limited to 30 fps ────────────────
             if not self._all_info_rows: return
             delta   = -2 if event.button == 'up' else 2
-            total   = len(self._filtered_rows())
+            total   = len(self._all_info_rows)
             max_off = max(0, total - self._info_visible)
             self._info_scroll = max(0, min(max_off, self._info_scroll + delta))
-            self._redraw_info_table()
+            now = time.perf_counter()
+            if now - self._last_table_redraw >= 1 / 30:
+                self._last_table_redraw = now
+                self._redraw_info_table()
+                self.fig.canvas.draw_idle()
+
+    # ─── sidebar resize ───────────────────────────────────────────────────────
+
+    def _is_near_divider(self, event) -> bool:
+        if event.x is None:
+            return False
+        bbox = self.fig.bbox
+        fig_x = (event.x - bbox.x0) / bbox.width
+        return abs(fig_x - (self._sidebar_left - 0.008)) < 0.012
+
+    def _resize_layout(self):
+        """Reposition axes and widgets after sidebar_left changes."""
+        sl  = self._sidebar_left
+        gap = 0.010
+        # Board axes
+        self.ax.set_position([0.005, 0.11, sl - gap - 0.005, 0.835])
+        # Info axes
+        iw = max(0.08, 1.0 - sl - 0.005)
+        self.ax_info.set_position([sl, 0.11, iw, 0.875])
+        # Divider line
+        dx = sl - gap / 2
+        self._divider_line.set_xdata([dx, dx])
+
+    def _get_c2(self) -> float:
+        """C2 axes-fraction so TP column keeps same physical width as sidebar grows."""
+        sidebar_w = max(0.08, 1.0 - self._sidebar_left - 0.005)
+        tp_col_axes_frac = min(0.50, self._TP_COL_FIG_W / sidebar_w)
+        return max(0.40, 1.0 - tp_col_axes_frac - 0.02)
+
+    def _max_net_chars(self) -> int:
+        """Max chars for net name in table based on current sidebar width."""
+        sidebar_w = max(0.08, 1.0 - self._sidebar_left - 0.005)
+        c2 = self._get_c2()
+        col1_frac = c2 - 0.06   # axes-fraction available to signal text
+        return max(8, int(35 * (sidebar_w / 0.350) * (col1_frac / 0.50)))
+
+    def _on_motion(self, event):
+        # ── crosshair ─────────────────────────────────────────────────────────
+        on_board = (event.inaxes == self.ax
+                    and event.xdata is not None and event.ydata is not None)
+        if on_board:
+            self._crosshair_h.set_ydata([event.ydata, event.ydata])
+            self._crosshair_v.set_xdata([event.xdata, event.xdata])
+            self._crosshair_h.set_visible(True)
+            self._crosshair_v.set_visible(True)
+            self.fig.canvas.draw_idle()
+        elif self._crosshair_h.get_visible():
+            self._crosshair_h.set_visible(False)
+            self._crosshair_v.set_visible(False)
+            self.fig.canvas.draw_idle()
+
+        # ── sidebar drag ──────────────────────────────────────────────────────
+        if not self._dragging_sidebar or event.x is None:
+            return
+        bbox = self.fig.bbox
+        new_left = (event.x - bbox.x0) / bbox.width + 0.008
+        self._sidebar_left = max(0.25, min(0.90, new_left))
+        self._resize_layout()
+
+        now = time.perf_counter()
+        if now - self._last_table_redraw >= 1 / 30:
+            self._last_table_redraw = now
+            if self._info_mode == 'net_detail' and self._net_conn_current:
+                current_side = 'TOP' if self._view_mode == 'top' else 'BOT'
+                self._show_net_detail(
+                    self._net_conn_current,
+                    self._net_conn_points,
+                    current_side=current_side)
+            elif self._info_mode == 'net_list' and self._net_list_query:
+                self._show_net_list(
+                    self._net_list_query, self._net_list_nets)
+            elif self._info_mode == 'comp':
+                self._redraw_info_table()
+        self.fig.canvas.draw_idle()
+
+    def _on_release(self, event):
+        if self._dragging_sidebar:
+            self._dragging_sidebar = False
+            if self._info_mode == 'net_detail' and self._net_conn_current:
+                current_side = 'TOP' if self._view_mode == 'top' else 'BOT'
+                self._show_net_detail(
+                    self._net_conn_current,
+                    self._net_conn_points,
+                    current_side=current_side)
+            elif self._info_mode == 'net_list' and self._net_list_query:
+                self._show_net_list(
+                    self._net_list_query, self._net_list_nets)
+            elif self._info_mode == 'comp':
+                self._redraw_info_table()
             self.fig.canvas.draw_idle()
 
     # ─── board annotation helpers ──────────────────────────────────────────
@@ -886,12 +1187,14 @@ class PCBViewer:
         if not tp: return
         net = self._tp_net.get(tp_refdes, '?')
         r   = self._r(tp)
+        tp_comp = self.data['components'].get(tp_refdes, {})
+        pad_stack = self._tp_pad_map.get(tp_refdes, '')
 
-        # Glow ring – tight around pad, bright red
-        self._board_ring = Circle(
-            (tp['x'], tp['y']), r * self._RING_MULT,
-            fill=False, edgecolor='#FF2222', linewidth=2.2,
-            zorder=15, alpha=1.0)
+        # Glow ring – shape-aware and tight around the actual pad
+        self._board_ring = self._make_pad_highlight_patch(
+            tp['x'], tp['y'], pad_stack, True, '#FF2222',
+            side=tp_comp.get('side', 'TOP'),
+            pin_rotation=tp_comp.get('rotate', 0.0))
         self.ax.add_patch(self._board_ring)
 
         # Compact annotation just above the TP
@@ -914,6 +1217,10 @@ class PCBViewer:
         if event.button != 1: return
         if self.fig.canvas.toolbar and self.fig.canvas.toolbar.mode: return
 
+        if self._is_near_divider(event):
+            self._dragging_sidebar = True
+            return
+
         if event.inaxes == self.ax:
             self._handle_board_click(event)
         elif event.inaxes == self.ax_info:
@@ -921,12 +1228,27 @@ class PCBViewer:
 
     # ── click on PCB board ────────────────────────────────────────────────
 
+    def _find_comp_at(self, xc: float, yc: float, side: str = None):
+        """Return refdes of smallest bounding-box component that contains (xc, yc)."""
+        bounds = self.data.get('comp_bounds', {})
+        comps  = self.data['components']
+        best, best_area = None, float('inf')
+        for refdes, b in bounds.items():
+            comp = comps.get(refdes)
+            if not comp or is_testpoint(comp): continue
+            if side and comp.get('side', 'TOP') != side: continue
+            if b['xmin'] <= xc <= b['xmax'] and b['ymin'] <= yc <= b['ymax']:
+                area = (b['xmax'] - b['xmin']) * (b['ymax'] - b['ymin'])
+                if area < best_area:
+                    best_area, best = area, refdes
+        return best
+
     def _handle_board_click(self, event):
         if self._view_mode == 'bottom':
             self._handle_bottom_click(event)
             return
 
-        TOL = max(self._r(c) * 3.0 for _, c in self._tp_order) if self._tp_order else 1.0
+        TOL = self._tp_click_tol
         best_dist, best_r = TOL, None
         for refdes, c in self._tp_order:
             d = math.hypot(c['x'] - event.xdata, c['y'] - event.ydata)
@@ -934,11 +1256,36 @@ class PCBViewer:
                 best_dist, best_r = d, refdes
 
         if best_r:
+            net = self._tp_net.get(best_r, '')
+            if net and not is_gnd_net(net):
+                self._on_net_selected(net)
+                self.fig.canvas.draw_idle()
+                return
+            self._clear_highlights()
             self._place_board_annot(best_r)
             self._show_info_tp(best_r)
-        else:
-            self._remove_board_annot()
             self.fig.canvas.draw_idle()
+            return
+
+        comp_r = self._find_comp_at(event.xdata, event.ydata, side='TOP')
+        if comp_r:
+            comps = self.data['components']
+            comp  = comps[comp_r]
+            raw_map = self._comp_to_tps.get(comp_r, {})
+            tp_map = {tp_r: [(n, pn, pnm) for n, pn, pnm in nl if not is_gnd_net(n)]
+                      for tp_r, nl in raw_map.items()}
+            tp_map = {k: v for k, v in tp_map.items() if v}
+            self._clear_highlights()
+            a = self.ax.scatter([comp['x']], [comp['y']], s=240,
+                                color='#FFDD57', marker='*', zorder=12,
+                                linewidths=0.5, edgecolors='#AA8800')
+            self._highlights.append(a)
+            self._show_info_comp(comp_r, comp, tp_map)
+            self.fig.canvas.draw_idle()
+            return
+
+        self._on_clear()
+        self.fig.canvas.draw_idle()
 
     def _handle_bottom_click(self, event):
         """Click handler for BOTTOM view.
@@ -951,14 +1298,22 @@ class PCBViewer:
         # ── 1. nearest pin ────────────────────────────────────────────────
         best_pin_d, best_pin = tol, None
         for entry in getattr(self, '_bot_pin_data', []):
-            refdes, px, py, pin_name, pin_number, pad_stack = entry
+            refdes, px, py, pin_name, pin_number, pad_stack, pin_rot = entry
             d = math.hypot(px - mx, py - my)
             if d < best_pin_d:
                 best_pin_d, best_pin = d, entry
 
         if best_pin:
-            refdes, px, py, pin_name, pin_number, pad_stack = best_pin
-            self._highlight_bottom_pin(px, py, pad_stack)
+            refdes, px, py, pin_name, pin_number, pad_stack, pin_rot = best_pin
+            comp_nets_list = self.data['comp_nets'].get(refdes, [])
+            pin_nets = [net for net, pn, pnm in comp_nets_list
+                        if str(pn) == str(pin_number)
+                        or (pnm and pnm.upper() == pin_name.upper())]
+            if pin_nets:
+                self._on_net_selected(pin_nets[0])
+                self.fig.canvas.draw_idle()
+                return
+            self._highlight_bottom_pin(px, py, pad_stack, pin_rot)
             self._show_info_pin(refdes, pin_name, pin_number, px, py)
             self.fig.canvas.draw_idle()
             return
@@ -989,8 +1344,7 @@ class PCBViewer:
             self._show_info_comp(best, comps[best], {})
             self.fig.canvas.draw_idle()
         else:
-            self._clear_highlights()
-            self._show_idle_info()
+            self._on_clear()
             self.fig.canvas.draw_idle()
 
     def _highlight_bottom_comp(self, refdes: str):
@@ -1026,15 +1380,13 @@ class PCBViewer:
                       edgecolor='#FFDD57', linewidth=1.0, alpha=0.92))
         self._highlights.append(lbl)
 
-    def _highlight_bottom_pin(self, pin_x: float, pin_y: float, pad_stack: str):
-        """Draw a bright ring around a clicked pin."""
+    def _highlight_bottom_pin(self, pin_x: float, pin_y: float, pad_stack: str, pin_rotation: float = 0.0):
+        """Draw a bright shape-aware ring around a clicked pin."""
         self._clear_highlights()
-        r = self._pad_sizes.get(pad_stack, 0) / 2
-        if r <= 0:
-            r = 0.045
-        ring = Circle((pin_x, pin_y), r * 2.5,
-                      fill=False, edgecolor='#FF3333', linewidth=1.8,
-                      zorder=12, linestyle='-')
+        ring = self._make_pad_patch(
+            pin_x, pin_y, pad_stack, pin_rotation, 'BOTTOM',
+            fill=False, edgecolor='#FF3333', linewidth=1.8,
+            zorder=12, alpha=1.0, scale=1.35)
         self.ax.add_patch(ring)
         self._highlights.append(ring)
 
@@ -1048,7 +1400,7 @@ class PCBViewer:
         FM  = ax.transAxes
         y   = 0.96
 
-        def t(text, col='#C0D0E0', sz=8, bold=False, dy=0.030):
+        def t(text, col='#1F2937', sz=10, bold=False, dy=0.046):
             nonlocal y
             ax.text(0.04, y, text, transform=FM, color=col, fontsize=sz,
                     va='top', fontweight='bold' if bold else 'normal',
@@ -1056,12 +1408,12 @@ class PCBViewer:
             y -= dy
 
         # Header
-        t(f"{refdes}", col='#FFDD57', sz=11, bold=True, dy=0.036)
-        t(f"Pin  : {pin_number}  ({pin_name})", col='#4FC3F7', sz=9, bold=True, dy=0.028)
-        t(f"Pos  : ({pin_x:.3f}, {pin_y:.3f}) mm", col='#8899AA', sz=7.5, dy=0.022)
+        t(f"{refdes}", col=self._C_PANEL_HDR, sz=15, bold=True, dy=0.052)
+        t(f"Pin  : {pin_number}  ({pin_name})", col=self._C_TP_REFDES, sz=13, bold=True, dy=0.040)
+        t(f"Pos  : ({pin_x:.3f}, {pin_y:.3f}) mm", col=self._C_PANEL_SUB, sz=11, dy=0.033)
         t(f"Class: {comp.get('comp_class', '?')}   Value: {comp.get('value', '?')}",
-          col='#8899AA', sz=7.5, dy=0.022)
-        ax.plot([0, 1], [y, y], color='#1E2A3A', lw=0.6, transform=FM)
+          col=self._C_PANEL_SUB, sz=11, dy=0.033)
+        ax.plot([0, 1], [y, y], color=self._C_PANEL_DIV, lw=0.6, transform=FM)
         y -= 0.016
 
         # Find net(s) for this pin (match by pin_name or pin_number)
@@ -1070,28 +1422,86 @@ class PCBViewer:
         pin_nets   = [net for net, pn, pnm in comp_nets_list
                       if pn.upper() == pin_num_u or pnm.upper() == pin_name_u]
 
-        t("Net:", col='#90CDF4', sz=8, bold=True, dy=0.026)
+        t("Net:", col=self._C_PANEL_HDR, sz=12, bold=True, dy=0.038)
         if pin_nets:
             for net in pin_nets[:6]:
-                col = '#68D391' if not is_gnd_net(net) else '#3A5048'
-                t(f"  {net}", col=col, sz=8, dy=0.024)
+                col = self._C_NET_NAME if not is_gnd_net(net) else self._C_PANEL_SUB
+                t(f"  {net}", col=col, sz=12, dy=0.036)
         else:
-            t("  (no connection)", col='#445566', sz=7.5, dy=0.022)
+            t("  (no connection)", col=self._C_PANEL_SUB, sz=11, dy=0.033)
 
     # ── click on info panel row ───────────────────────────────────────────
 
     def _handle_info_click(self, event):
-        if not self._info_rows: return
+        if not self._info_rows and not self._no_tp_pin_rows: return
         ax_y = self.ax_info.transAxes.inverted().transform(
             (event.x, event.y))[1]
-        best_dist, best_tp = 0.018, None
-        for (y_ctr, tp_r, _net) in self._info_rows:
-            if tp_r and abs(ax_y - y_ctr) < best_dist:
-                best_dist = abs(ax_y - y_ctr)
-                best_tp   = tp_r
+
+        if self._info_mode == 'search_results' and self._search_results:
+            best_dist, best_idx = 0.028, None
+            for y_ctr, idx, _ in self._info_rows:
+                dist = abs(ax_y - y_ctr)
+                if dist < best_dist:
+                    best_dist, best_idx = dist, idx
+            if best_idx is not None and 0 <= best_idx < len(self._search_results):
+                _score, kind, key = self._search_results[best_idx]
+                if kind == 'net':
+                    self._on_net_selected(str(key))   # đi thẳng vào detail, không qua list
+                else:
+                    self.textbox.set_val(str(key))
+                    self._on_search(str(key))
+            return
+
+        if self._info_mode == 'net_detail' and self._no_tp_pin_rows:
+            best_dist, best_row = 0.028, None
+            for row in self._no_tp_pin_rows:
+                if abs(ax_y - row[0]) < best_dist:
+                    best_dist = abs(ax_y - row[0])
+                    best_row  = row
+            if best_row:
+                _, refdes, pin_num, px, py, side, is_tp, pad_stack, pin_rot = best_row
+                ep = dict(
+                    refdes=refdes, pin_number=pin_num,
+                    px=px, py=py, side=side, is_tp=is_tp,
+                    pad_stack=pad_stack, pin_rot=pin_rot,
+                )
+                self._on_endpoint_selected(ep)
+            return
+
+        if self._info_mode == 'net_list':
+            best_dist, best_net_name = 0.028, None
+            for (y_ctr, net_name, _) in self._info_rows:
+                if abs(ax_y - y_ctr) < best_dist:
+                    best_dist     = abs(ax_y - y_ctr)
+                    best_net_name = net_name
+            if best_net_name:
+                self._on_net_selected(best_net_name)
+            return
+
+        # Chế độ comp: click row có TP → pan đến TP
+        #              click row không TP → show net connections
+        best_dist, best_tp = 0.028, None
+        best_net           = None
+        best_no_tp_net     = None
+        for (y_ctr, tp_r, net) in self._info_rows:
+            dist = abs(ax_y - y_ctr)
+            if dist < best_dist:
+                best_dist = dist
+                if tp_r:
+                    best_tp        = tp_r
+                    best_net       = net
+                    best_no_tp_net = None
+                else:
+                    best_no_tp_net = net
+                    best_net       = net
+                    best_tp        = None
+
         if best_tp:
+            self._clear_board_highlights()
             self._place_board_annot(best_tp)
             self._pan_to_tp(best_tp)
+        elif best_no_tp_net:
+            self._on_net_selected(best_no_tp_net)
 
     def _pan_to_tp(self, tp_refdes: str):
         """Pan board to center on tp_refdes, keeping current zoom level."""
@@ -1105,7 +1515,234 @@ class PCBViewer:
         self.ax.set_ylim(tp['y'] - half_h, tp['y'] + half_h)
         self.fig.canvas.draw_idle()
 
+    def _pan_to_point(self, px: float, py: float):
+        """Pan board to centre on (px, py) keeping current zoom."""
+        xlim   = self.ax.get_xlim()
+        ylim   = self.ax.get_ylim()
+        half_w = (xlim[1] - xlim[0]) / 2
+        half_h = (ylim[1] - ylim[0]) / 2
+        self.ax.set_xlim(px - half_w, px + half_w)
+        self.ax.set_ylim(py - half_h, py + half_h)
+        self.fig.canvas.draw_idle()
+
+    def _make_pad_highlight_patch(self, px, py, pad_stack, is_tp, color,
+                                   side='TOP', pin_rotation=0.0,
+                                   linewidth=2.2, alpha=1.0):
+        scale = 1.45 if is_tp else 1.35
+        return self._make_pad_patch(
+            px, py, pad_stack, pin_rotation, side,
+            fill=False, edgecolor=color, facecolor='none',
+            linewidth=linewidth, zorder=15, alpha=alpha, scale=scale)
+
+    def _show_net_list(self, query: str, nets: list):
+        self._clear_info()
+        self._info_mode      = 'net_list'
+        self._net_list_nets  = nets
+        self._net_list_query = query
+        ax = self.ax_info
+        FM = ax.transAxes
+        y  = 0.985
+        DY = 0.042
+
+        ax.text(0.03, y, f'Net: "{query}"',
+                transform=FM, color=self._C_PANEL_HDR, fontsize=12,
+                va='top', fontweight='bold', fontfamily='monospace')
+        y -= 0.048
+        ax.text(0.03, y,
+                f'{len(nets)} result(s)  —  click to inspect',
+                transform=FM, color=self._C_PANEL_SUB, fontsize=9,
+                va='top', fontfamily='monospace')
+        y -= 0.028
+        ax.plot([0, 1], [y, y], color=self._C_PANEL_DIV, lw=0.7, transform=FM)
+        y -= 0.016
+
+        self._info_rows.clear()
+        for net in nets:
+            if y < 0.04:
+                ax.text(0.03, y, '  …', transform=FM,
+                        color=self._C_PANEL_MUTE, fontsize=9,
+                        va='top', fontfamily='monospace')
+                break
+            pts   = self._collect_net_points(net)
+            n_tp  = sum(1 for p in pts if p['is_tp'])
+            n_pin = sum(1 for p in pts if not p['is_tp'])
+            col   = self._C_PANEL_MUTE if is_gnd_net(net) else self._C_NET_NAME
+
+            ax.text(0.03, y, net,
+                    transform=FM, color=col, fontsize=10,
+                    va='top', fontweight='bold',
+                    fontfamily='monospace', clip_on=True)
+            ax.text(0.62, y, f'TP:{n_tp}  PIN:{n_pin}',
+                    transform=FM, color=self._C_PANEL_SUB, fontsize=9,
+                    va='top', fontfamily='monospace', clip_on=True)
+
+            self._info_rows.append((y - DY * 0.4, net, None))
+            y -= DY
+
+        self.fig.canvas.draw_idle()
+
+    def _on_net_selected(self, net: str, highlight_refdes: str = None):
+        self._net_conn_current = net
+        current_side = 'TOP' if self._view_mode == 'top' else 'BOT'
+        all_points   = self._collect_net_points(net)
+        self._net_conn_points = all_points   # cache cho sidebar resize
+
+        self._clear_board_highlights()
+        for ep in all_points:
+            if ep['side'] != current_side:
+                continue
+            patch = self._make_pad_highlight_patch(
+                ep['px'], ep['py'], ep['pad_stack'],
+                ep['is_tp'], '#FF2222',
+                side=ep['side'], pin_rotation=ep['pin_rot'])
+            self.ax.add_patch(patch)
+            self._highlights.append(patch)
+        self.fig.canvas.draw_idle()
+
+        self._show_net_detail(net, all_points,
+                              current_side=current_side,
+                              highlight_refdes=highlight_refdes)
+
+    def _show_net_detail(self, net: str, all_points: list,
+                         current_side: str,
+                         highlight_refdes: str = None):
+        ax = self.ax_info
+        ax.cla(); ax.axis('off')
+        ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+        ax.add_patch(mpatches.Rectangle(
+            (0, 0), 1, 1, transform=ax.transAxes,
+            facecolor=self._C_PANEL_BG, edgecolor='none', zorder=-1))
+        self._info_rows.clear()
+        self._no_tp_pin_rows = []
+        self._info_mode      = 'net_detail'
+        FM  = ax.transAxes
+        y   = 0.985
+        DY  = 0.052
+
+        ax.text(0.03, y, f'Net: {net}',
+                transform=FM, color=self._C_PANEL_HDR, fontsize=13,
+                va='top', fontweight='bold', fontfamily='monospace')
+        y -= 0.048
+
+        n_cur   = sum(1 for p in all_points if p['side'] == current_side)
+        n_other = len(all_points) - n_cur
+        other   = 'BOT' if current_side == 'TOP' else 'TOP'
+        ax.text(0.03, y,
+                f'{n_cur} endpoint on {current_side}  ·  {n_other} on {other}',
+                transform=FM, color=self._C_PANEL_SUB, fontsize=10,
+                va='top', fontfamily='monospace')
+        y -= 0.030
+        ax.plot([0, 1], [y, y], color=self._C_PANEL_DIV, lw=0.7, transform=FM)
+        y -= 0.016
+
+        if not all_points:
+            ax.text(0.03, y, 'No endpoints found.',
+                    transform=FM, color='#DC2626', fontsize=10,
+                    va='top', fontfamily='monospace')
+            self.fig.canvas.draw_idle()
+            return
+
+        def _sort_key(ep):
+            return (0 if ep['side'] == current_side else 1,
+                    0 if ep['is_tp'] else 1,
+                    ep['label'])
+        sorted_pts = sorted(all_points, key=_sort_key)
+
+        prev_side = None
+        for ep in sorted_pts:
+            if y < 0.04:
+                ax.text(0.03, y, '  …', transform=FM,
+                        color=self._C_PANEL_MUTE, fontsize=9,
+                        va='top', fontfamily='monospace')
+                break
+
+            if ep['side'] != prev_side:
+                grp       = ep['side']
+                is_active = (grp == current_side)
+                marker    = '●' if is_active else '○'
+                grp_col   = self._C_NET_NAME if is_active else self._C_PANEL_TEXT
+                ax.text(0.03, y, f'{marker} {grp}',
+                        transform=FM, color=grp_col, fontsize=8,
+                        va='top', fontfamily='monospace', style='italic')
+                y -= DY * 0.65
+                prev_side = ep['side']
+
+            if ep['is_tp']:
+                col = self._C_TP_REFDES
+            else:
+                col = self._C_PANEL_TEXT
+
+            is_origin = (highlight_refdes
+                         and ep['refdes'] == highlight_refdes)
+            if is_origin:
+                ax.axhspan(y - DY * 0.15, y + DY * 0.55,
+                           xmin=0.01, xmax=0.97,
+                           facecolor='#E0F0FF', alpha=0.8,
+                           transform=FM, zorder=0)
+
+            ax.text(0.06, y, ep['label'],
+                    transform=FM, color=col, fontsize=11,
+                    va='top',
+                    fontweight='bold' if is_origin else 'normal',
+                    fontfamily='monospace', clip_on=True)
+
+            badge_col = self._C_NET_NAME if ep['side'] == current_side else self._C_PANEL_TEXT
+            ax.text(0.72, y, f"[{ep['side']}]",
+                    transform=FM, color=badge_col, fontsize=8,
+                    va='top', fontfamily='monospace', clip_on=True)
+
+            self._no_tp_pin_rows.append((
+                y - DY * 0.40,
+                ep['refdes'],
+                ep['pin_number'],
+                ep['px'], ep['py'],
+                ep['side'],
+                ep['is_tp'],
+                ep['pad_stack'],
+                ep['pin_rot'],
+            ))
+            y -= DY
+
+        self.fig.canvas.draw_idle()
+
+    def _on_endpoint_selected(self, ep: dict):
+        saved_net = self._net_conn_current
+
+        if ep['side'] == 'TOP' and self._view_mode != 'top':
+            self._on_top_view()
+            self._on_net_selected(saved_net)
+        elif ep['side'] == 'BOT' and self._view_mode != 'bottom':
+            self._on_bottom_view()
+            self._on_net_selected(saved_net)
+
+        for a in list(self._highlights):
+            try: a.remove()
+            except Exception: pass
+        self._highlights.clear()
+
+        patch = self._make_pad_highlight_patch(
+            ep['px'], ep['py'], ep['pad_stack'],
+            ep['is_tp'], '#FF2222',
+            side=ep['side'], pin_rotation=ep['pin_rot'])
+        self.ax.add_patch(patch)
+        self._highlights.append(patch)
+
+        self._pan_to_point(ep['px'], ep['py'])
+
     # ─── search / highlight ───────────────────────────────────────────────
+
+    def _reset_info_state(self):
+        self._info_rows.clear()
+        self._all_info_rows.clear()
+        self._info_scroll    = 0
+        self._current_comp   = None
+        self._info_mode      = 'idle'
+        self._info_net_query = ''
+        self._no_tp_pin_rows = []
+        self._search_results     = []
+        self._selected_result_idx = 0
+        self._net_list_nets  = []
+        self._net_list_query = ''
 
     def _clear_highlights(self):
         for a in self._highlights:
@@ -1117,20 +1754,32 @@ class PCBViewer:
             except Exception: pass
             self._ring_collection = None
         self._remove_board_annot()
-        self._info_rows.clear()
-        self._all_info_rows.clear()
-        self._info_scroll    = 0
-        self._current_comp   = None
-        self._info_mode      = 'idle'
-        self._info_net_query = ''
+        self._reset_info_state()
+
+    def _clear_board_highlights(self):
+        """Remove board highlight patches/rings/annotation; preserve info-panel state."""
+        for a in self._highlights:
+            try: a.remove()
+            except Exception: pass
+        self._highlights.clear()
+        if self._ring_collection:
+            try: self._ring_collection.remove()
+            except Exception: pass
+            self._ring_collection = None
+        self._remove_board_annot()
 
     def _on_clear(self, _=None):
         self.textbox.set_val('')
-        self.filter_box.set_val('')
-        self._panel_filter = ''
+        self._net_conn_current = ''
+        self._net_conn_points  = []
         self._clear_highlights()
         self._show_idle_info()
         self.fig.canvas.draw_idle()
+
+    def _on_key_press(self, event):
+        if event.key == 'escape':
+            self._on_clear()
+            self.fig.canvas.draw_idle()
 
     def _on_search(self, text=None):
         query = (text if isinstance(text, str) else self.textbox.text).strip().upper()
@@ -1143,51 +1792,98 @@ class PCBViewer:
         comps     = self.data['components']
         comp_nets = self.data['comp_nets']
         netlist   = self.data['netlist']
+        candidates = []
 
-        # 1. Exact refdes match
-        matches = [r for r in comps if r.upper() == query]
+        for refdes, comp in comps.items():
+            ru = refdes.upper()
+            side_bonus = 5 if comp.get('side', 'TOP') == ('TOP' if self._view_mode == 'top' else 'BOT') else 0
+            if ru == query:
+                candidates.append((100 + side_bonus, 'comp', refdes))
+            elif ru.startswith(query):
+                candidates.append((80 + side_bonus, 'comp', refdes))
+            elif query in ru:
+                candidates.append((70 + side_bonus, 'comp', refdes))
 
-        # 2. Refdes prefix / substring
-        if not matches:
-            matches = [r for r in comps if r.upper().startswith(query)]
-        if not matches:
-            matches = [r for r in comps if query in r.upper()]
+        for net in netlist:
+            nu = net.upper()
+            if nu == query:
+                candidates.append((90, 'net', net))
+            elif query in nu:
+                candidates.append((50, 'net', net))
 
-        # 3. TP refdes — find components connected to this TP
-        if not matches:
-            tp_match = next((r for r in self._testpoints if r.upper() == query), None)
-            if tp_match is None:
-                tp_match = next((r for r in self._testpoints
-                                 if r.upper().startswith(query)), None)
-            if tp_match is None:
-                tp_match = next((r for r in self._testpoints
-                                 if query in r.upper()), None)
-            if tp_match:
-                # Collect non-TP comps that share a net with this TP
-                nets_of_tp = [n for n, _, _ in comp_nets.get(tp_match, [])]
-                seen = set()
-                for net in nets_of_tp:
-                    for r, _, _ in netlist.get(net, []):
-                        if r not in seen and r in comps and not is_testpoint(comps[r]):
-                            seen.add(r)
-                            matches.append(r)
+        # TP-driven component candidates
+        tp_match = next((r for r in self._testpoints if r.upper() == query), None)
+        if tp_match is None:
+            tp_match = next((r for r in self._testpoints if r.upper().startswith(query)), None)
+        if tp_match is None:
+            tp_match = next((r for r in self._testpoints if query in r.upper()), None)
+        if tp_match:
+            nets_of_tp = [n for n, _, _ in comp_nets.get(tp_match, [])]
+            seen = set()
+            for net in nets_of_tp:
+                for r, _, _ in netlist.get(net, []):
+                    if r not in seen and r in comps and not is_testpoint(comps[r]):
+                        seen.add(r)
+                        candidates.append((60, 'comp', r))
 
-        # 4. Net / signal name — signal-centric panel
-        if not matches:
-            found_nets = [n for n in netlist if query in n.upper()]
-            if found_nets:
-                self._show_info_nets(query, found_nets)
-                self.fig.canvas.draw_idle()
-                return
-
-        if not matches:
+        if not candidates:
             self._show_info_none(query)
             self.fig.canvas.draw_idle()
             return
 
-        refdes = matches[0]
-        comp   = comps[refdes]
+        # Stable ranking: score desc, shorter id first, alphabetical
+        candidates.sort(key=lambda t: (-t[0], len(str(t[2])), str(t[2])))
+        top_score = candidates[0][0]
+        
+        # Tách net-only và comp-only trong top 20 candidates
+        top_nets  = [key for sc, kd, key in candidates[:20] if kd == 'net']
+        top_comps = [key for sc, kd, key in candidates[:20] if kd == 'comp']
+
+        # Trường hợp 1: Chỉ có net → show net list
+        if top_nets and not top_comps:
+            self._show_net_list(query, top_nets)
+            self.fig.canvas.draw_idle()
+            return
+
+        # Trường hợp 2: Chỉ có comp → flow cũ
+        if top_comps and not top_nets:
+            top_band = [c for c in candidates if top_score - c[0] <= 5]
+            if len(top_band) > 1:
+                self._show_info_search_results(query, candidates[:100])
+                self.fig.canvas.draw_idle()
+                return
+            kind, key = candidates[0][1], candidates[0][2]
+
+        # Trường hợp 3: Mix comp + net → show_info_search_results
+        if top_comps and top_nets:
+            self._show_info_search_results(query, candidates[:100])
+            self.fig.canvas.draw_idle()
+            return
+
+        refdes = key
+        comp   = comps.get(refdes)
+        if not comp:
+            self._show_info_none(query)
+            self.fig.canvas.draw_idle()
+            return
         self._current_comp = refdes
+
+        # Nếu comp là TP/TPA → chạy luồng net
+        if is_testpoint(comp):
+            nets_of_tp = [n for n, _, _ in comp_nets.get(refdes, [])
+                          if not is_gnd_net(n)]
+            # Vẽ star vàng tại TP để user biết điểm xuất phát
+            a = self.ax.scatter([comp['x']], [comp['y']], s=240,
+                                color='#FFDD57', marker='*', zorder=12,
+                                linewidths=0.5, edgecolors='#AA8800')
+            self._highlights.append(a)
+            if nets_of_tp:
+                self._on_net_selected(nets_of_tp[0],
+                                      highlight_refdes=refdes)
+            else:
+                self._show_info_tp(refdes)
+            self.fig.canvas.draw_idle()
+            return
 
         raw_map = self._comp_to_tps.get(refdes, {})
         # Filter GND-only TPs
@@ -1216,9 +1912,12 @@ class PCBViewer:
             for tp_r in tp_map:
                 tp = self._testpoints.get(tp_r)
                 if not tp: continue
-                ring_patches.append(
-                    Circle((tp['x'], tp['y']),
-                           self._r(tp) * self._RING_MULT))
+                tp_comp = self.data['components'].get(tp_r, {})
+                pad_stack = self._tp_pad_map.get(tp_r, '')
+                ring_patches.append(self._make_pad_highlight_patch(
+                    tp['x'], tp['y'], pad_stack, True, '#FF2222',
+                    side=tp_comp.get('side', 'TOP'),
+                    pin_rotation=tp_comp.get('rotate', 0.0)))
 
             self._ring_collection = PatchCollection(
                 ring_patches, facecolors='none',
@@ -1244,10 +1943,15 @@ class PCBViewer:
     def _clear_info(self):
         self.ax_info.cla()
         self.ax_info.axis('off')
-        self.ax_info.set_facecolor('#0A1018')
+        self.ax_info.set_xlim(0, 1); self.ax_info.set_ylim(0, 1)
+        self.ax_info.add_patch(mpatches.Rectangle(
+            (0, 0), 1, 1, transform=self.ax_info.transAxes,
+            facecolor=self._C_PANEL_BG, edgecolor='none', zorder=-1))
         self._info_rows.clear()
         self._all_info_rows.clear()
         self._info_scroll = 0
+        self._search_results = []
+        self._selected_result_idx = 0
 
     # ── Click on TP: show TP info in panel ───────────────────────────────
     def _show_info_tp(self, refdes: str):
@@ -1258,26 +1962,26 @@ class PCBViewer:
         FM   = ax.transAxes
         y    = 0.96
 
-        def t(text, col='#C0D0E0', sz=8, bold=False, dy=0.030):
+        def t(text, col='#1F2937', sz=10, bold=False, dy=0.046):
             nonlocal y
             ax.text(0.04, y, text, transform=FM, color=col, fontsize=sz,
                     va='top', fontweight='bold' if bold else 'normal',
                     fontfamily='monospace', clip_on=True)
             y -= dy
 
-        t(refdes, col='#FFDD57', sz=12, bold=True, dy=0.038)
-        t(f"Pos : ({tp['x']:.3f}, {tp['y']:.3f}) mm", col='#8899AA', sz=7.5, dy=0.022)
-        t(f"Pad : {tp['sym_name']}", col='#8899AA', sz=7.5, dy=0.024)
-        ax.plot([0,1],[y,y], color='#1E2A3A', lw=0.6, transform=FM); y -= 0.016
+        t(refdes, col=self._C_TP_REFDES, sz=18, bold=True, dy=0.056)
+        t(f"Pos : ({tp['x']:.3f}, {tp['y']:.3f}) mm", col=self._C_PANEL_SUB, sz=11, dy=0.033)
+        t(f"Pad : {tp['sym_name']}", col=self._C_PANEL_SUB, sz=11, dy=0.036)
+        ax.plot([0,1],[y,y], color=self._C_PANEL_DIV, lw=0.6, transform=FM); y -= 0.016
 
-        t("Signals:", col='#90CDF4', sz=8, bold=True, dy=0.026)
+        t("Signals:", col=self._C_PANEL_HDR, sz=12, bold=True, dy=0.038)
         for net in nets:
-            if y < 0.06: break
-            col = '#68D391' if not is_gnd_net(net) else '#3A5048'
-            t(f"  {net}", col=col, sz=7.5, dy=0.022)
+            if y < 0.08: break
+            col = self._C_NET_NAME if not is_gnd_net(net) else self._C_PANEL_SUB
+            t(f"  {net}", col=col, sz=11, dy=0.033)
 
-        ax.plot([0,1],[y,y], color='#1E2A3A', lw=0.6, transform=FM); y -= 0.016
-        t("Components on these nets:", col='#90CDF4', sz=8, bold=True, dy=0.026)
+        ax.plot([0,1],[y,y], color=self._C_PANEL_DIV, lw=0.6, transform=FM); y -= 0.016
+        t("Components on these nets:", col=self._C_PANEL_HDR, sz=12, bold=True, dy=0.038)
         netlist = self.data['netlist']
         seen = set()
         for net in nets:
@@ -1286,12 +1990,13 @@ class PCBViewer:
                 if r == refdes or r in seen: continue
                 if is_testpoint(self.data['components'].get(r, {})): continue
                 seen.add(r)
-                if y < 0.05: t("  …", col='#445566', sz=7); break
-                t(f"  {r:<12} {net}", col='#9AE6B4', sz=7, dy=0.020)
+                if y < 0.07: t("  …", col=self._C_PANEL_SUB, sz=10); break
+                t(f"  {r:<12} {net}", col=self._C_PANEL_TEXT, sz=10, dy=0.030)
 
     # ── Search: two-column scrollable table (signal → test point) ────────
     def _show_info_comp(self, refdes: str, comp: dict, tp_map: dict):
         self._clear_info()
+        self._info_mode = 'comp'
 
         # Build net → first matching TP
         net_to_tp: dict = {}
@@ -1346,7 +2051,11 @@ class PCBViewer:
     def _redraw_info_table(self):
         """Render the currently visible slice of the info table."""
         ax = self.ax_info
-        ax.cla(); ax.axis('off'); ax.set_facecolor('#0A1018')
+        ax.cla(); ax.axis('off')
+        ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+        ax.add_patch(mpatches.Rectangle(
+            (0, 0), 1, 1, transform=ax.transAxes,
+            facecolor=self._C_PANEL_BG, edgecolor='none', zorder=-1))
         self._info_rows.clear()
 
         refdes = getattr(self, '_info_comp_refdes', None)
@@ -1356,67 +2065,58 @@ class PCBViewer:
         FM = ax.transAxes
 
         # ── fixed header (always visible) ─────────────────────────────────
-        HEADER_H = 0.175    # fraction of axes height used by header
+        HEADER_H = 0.26    # fraction of axes height used by header
         y = 0.985
         info_mode = getattr(self, '_info_mode', 'comp')
         if info_mode == 'net':
             ax.text(0.03, y, f'Signal: "{self._info_net_query}"',
-                    transform=FM, color='#AAFFCC', fontsize=10, va='top',
+                    transform=FM, color=self._C_PANEL_HDR, fontsize=13, va='top',
                     fontweight='bold', fontfamily='monospace')
-            y -= 0.044
+            y -= 0.060
         else:
-            ax.text(0.03, y, refdes, transform=FM, color='#FFDD57',
-                    fontsize=11, va='top', fontweight='bold',
+            ax.text(0.03, y, refdes, transform=FM, color=self._C_PANEL_HDR,
+                    fontsize=15, va='top', fontweight='bold',
                     fontfamily='monospace')
-            y -= 0.032
+            y -= 0.048
             ax.text(0.03, y,
                     f"Class: {comp['comp_class']}   Value: {comp['value']}",
-                    transform=FM, color='#6A7E94', fontsize=7, va='top',
+                    transform=FM, color=self._C_PANEL_SUB, fontsize=10, va='top',
                     fontfamily='monospace')
-            y -= 0.020
+            y -= 0.028
             ax.text(0.03, y,
                     f"Pos: ({comp['x']:.3f}, {comp['y']:.3f}) mm",
-                    transform=FM, color='#6A7E94', fontsize=7, va='top',
+                    transform=FM, color=self._C_PANEL_SUB, fontsize=10, va='top',
                     fontfamily='monospace')
-            y -= 0.015
-        ax.plot([0,1],[y,y], color='#1E2A3A', lw=0.7, transform=FM)
-        y -= 0.010
+            y -= 0.022
+        ax.plot([0,1],[y,y], color=self._C_PANEL_DIV, lw=0.7, transform=FM)
+        y -= 0.012
 
-        total_all = len(self._all_info_rows)
-        n_with_tp = sum(1 for _, _, _, t in self._all_info_rows if t)
-
-        # Apply panel filter
-        visible_rows = self._filtered_rows()
+        visible_rows = self._all_info_rows
         total        = len(visible_rows)
+        n_with_tp    = sum(1 for _, _, _, t in visible_rows if t)
 
-        q = self._panel_filter
-        if q:
-            ax.text(0.03, y,
-                    f"Filter '{q}': {total}/{total_all}  (TP:{n_with_tp})",
-                    transform=FM, color='#AAFFCC', fontsize=6.5, va='top',
-                    fontfamily='monospace')
-        else:
-            ax.text(0.03, y,
-                    f"Signals: {total_all}  (TP: {n_with_tp}  no TP: {total_all-n_with_tp})",
-                    transform=FM, color='#4A6880', fontsize=6.5, va='top',
-                    fontfamily='monospace')
-        y -= 0.018
-        ax.plot([0,1],[y,y], color='#1E2A3A', lw=0.5, transform=FM)
+        ax.text(0.03, y,
+                f"Signals: {total}  (TP: {n_with_tp}  no TP: {total-n_with_tp})",
+                transform=FM, color=self._C_PANEL_SUB, fontsize=10, va='top',
+                fontfamily='monospace')
+        y -= 0.027
+        ax.plot([0,1],[y,y], color=self._C_PANEL_DIV, lw=0.5, transform=FM)
         y -= 0.004
 
         # Column header
-        C1, C2 = 0.02, 0.58
-        DY     = 0.0235
+        C1 = 0.02
+        C2 = self._get_c2()
+        DY = 0.052
         col_hdr = "SIGNAL" if info_mode == 'net' else "PIN   SIGNAL"
-        ax.text(C1, y, col_hdr, transform=FM, color='#90CDF4',
-                fontsize=6.8, va='top', fontweight='bold',
+        ax.text(C1, y, col_hdr, transform=FM, color=self._C_PANEL_HDR,
+                fontsize=11, va='top', fontweight='bold',
                 fontfamily='monospace')
         if self._view_mode != 'bottom':
-            ax.text(C2, y, "TEST POINT", transform=FM, color='#90CDF4',
-                    fontsize=6.8, va='top', fontweight='bold',
+            ax.text(C2, y, "TEST POINT", transform=FM, color=self._C_PANEL_HDR,
+                    fontsize=11, va='top', fontweight='bold',
                     fontfamily='monospace')
         y -= DY * 0.8
-        ax.plot([0,1],[y,y], color='#253545', lw=0.5, transform=FM)
+        ax.plot([0,1],[y,y], color=self._C_PANEL_DIV, lw=0.5, transform=FM)
         y -= DY * 0.3
 
         table_top = y
@@ -1442,7 +2142,7 @@ class PCBViewer:
         if slice_:
             first_g = _group(slice_[0][3])
             ax.text(C1, y, labels[first_g],
-                    transform=FM, color='#3A5060', fontsize=5.5,
+                    transform=FM, color=self._C_PANEL_SUB, fontsize=8,
                     va='top', fontfamily='monospace', style='italic')
             y -= DY * 0.65
 
@@ -1452,33 +2152,38 @@ class PCBViewer:
             # Draw separator between groups (only when group changes)
             if prev_group is not None and cur_group != prev_group:
                 ax.plot([0.01, 0.96], [y + DY*0.55, y + DY*0.55],
-                        color='#1E3040', lw=0.5, transform=FM)
+                        color=self._C_PANEL_DIV, lw=0.5, transform=FM)
                 # Group label
                 labels = {0: 'TP / TPA', 1: 'PP / PPA', 2: 'No test point'}
                 ax.text(C1, y + DY*0.52, labels[cur_group],
-                        transform=FM, color='#3A5060', fontsize=5.5,
+                        transform=FM, color=self._C_PANEL_SUB, fontsize=8,
                         va='bottom', fontfamily='monospace', style='italic')
             prev_group = cur_group
 
             has_tp  = tp_r is not None
-            sig_col = '#9AE6B4' if has_tp else '#5A7A8A'
-            net_str = net if len(net) <= 26 else net[:25] + '\u2026'
+            sig_col = self._C_NET_NAME if has_tp else self._C_PANEL_TEXT
+            _mc     = self._max_net_chars()
+            net_str = net if len(net) <= _mc else net[:_mc - 1] + '\u2026'
 
             row_label = net_str if info_mode == 'net' else f"p{pin_n:<4} {net_str}"
             ax.text(C1, y, row_label,
-                    transform=FM, color=sig_col, fontsize=6.2, va='top',
+                    transform=FM, color=sig_col, fontsize=11, va='top',
                     fontfamily='monospace', clip_on=True)
 
             if has_tp:
-                tp_col = _tp_color(tp_r)
+                r_up = tp_r.upper()
+                if r_up.startswith('TPA') or r_up.startswith('TP'):
+                    badge_txt, badge_bg = self._C_TP_REFDES, self._C_TAG_NET_BG
+                else:
+                    badge_txt, badge_bg = '#B45309', self._C_TAG_COMP_BG
                 ax.text(C2, y, tp_r,
-                        transform=FM, color=tp_col, fontsize=6.2, va='top',
+                        transform=FM, color=badge_txt, fontsize=11, va='top',
                         fontweight='bold', fontfamily='monospace', clip_on=True,
-                        bbox=dict(boxstyle='round,pad=0.10', facecolor='#0F1A28',
-                                  edgecolor=tp_col, alpha=0.6, linewidth=0.5))
+                        bbox=dict(boxstyle='round,pad=0.10', facecolor=badge_bg,
+                                  edgecolor=badge_txt, alpha=1.0, linewidth=0.7))
             else:
                 ax.text(C2, y, '\u2014',
-                        transform=FM, color='#2A3A48', fontsize=6.2, va='top',
+                        transform=FM, color=self._C_PANEL_SUB, fontsize=11, va='top',
                         fontfamily='monospace', clip_on=True)
 
             self._info_rows.append((y - DY * 0.4, tp_r, net))
@@ -1490,7 +2195,7 @@ class PCBViewer:
             sb_h  = table_top - 0.03
             # track
             ax.plot([sb_x, sb_x], [0.03, table_top],
-                    color='#1A2A38', lw=3, transform=FM,
+                    color=self._C_PANEL_DIV, lw=3, transform=FM,
                     solid_capstyle='round')
             # thumb
             frac   = max_rows / total
@@ -1498,95 +2203,86 @@ class PCBViewer:
             bot_f  = top_f - frac
             ax.plot([sb_x, sb_x],
                     [0.03 + bot_f * sb_h, 0.03 + top_f * sb_h],
-                    color='#4A7090', lw=3, transform=FM,
+                    color=self._C_LINK, lw=3, transform=FM,
                     solid_capstyle='round')
             # page info
             ax.text(0.50, 0.015,
                     f"rows {start+1}–{end} of {total}",
-                    transform=FM, color='#3A5060', fontsize=6,
+                    transform=FM, color=self._C_PANEL_SUB, fontsize=10,
                     ha='center', va='bottom', fontfamily='monospace')
 
-    def _show_info_nets(self, query: str, nets: list):
-        """Signal-centric panel: list all nets matching query with their TPs."""
+    def _show_info_search_results(self, query: str, results: list):
+        """Show ranked mixed search results (components + nets)."""
         self._clear_info()
-        self._info_mode      = 'net'
-        self._info_net_query = query
+        self._info_mode = 'search_results'
+        self._search_results = results
+        self._selected_result_idx = 0
+        ax = self.ax_info
+        FM = ax.transAxes
+        y = 0.985
+        DY = 0.050
+        self._info_rows.clear()
 
-        comp_nets = self.data['comp_nets']
-        tp_by_net: dict = defaultdict(list)
-        for r in self._testpoints:
-            for net, _, _ in comp_nets.get(r, []):
-                tp_by_net[net].append(r)
+        ax.text(0.03, y, f'Search: "{query}"', transform=FM, color=self._C_PANEL_HDR,
+                fontsize=13, va='top', fontweight='bold', fontfamily='monospace')
+        y -= 0.048
+        ax.text(0.03, y, f'{len(results)} close matches, click a row to focus',
+                transform=FM, color=self._C_PANEL_SUB, fontsize=10, va='top',
+                fontfamily='monospace')
+        y -= 0.028
+        ax.plot([0, 1], [y, y], color=self._C_PANEL_DIV, lw=0.7, transform=FM)
+        y -= 0.012
 
-        rows = []
-        all_tp_refdes = set()
-        for net in nets:
-            if is_gnd_net(net):
-                continue
-            tps = tp_by_net.get(net, [])
-            tp_r = tps[0] if tps else None
-            if tp_r:
-                all_tp_refdes.add(tp_r)
-            rows.append((net, '', '', tp_r))
-
-        def _sort_key(row):
-            tp_r = row[3]
-            if tp_r is None: return (2, row[0])
-            r = tp_r.upper()
-            if r.startswith('TPA') or r.startswith('TP'): return (0, row[0])
-            return (1, row[0])
-        rows.sort(key=_sort_key)
-
-        self._all_info_rows    = rows
-        self._info_scroll      = 0
-        self._info_comp_refdes = f'NET:{query}'
-        self._info_comp        = {'comp_class': '', 'value': '', 'x': 0, 'y': 0}
-
-        # Highlight all matching TPs on board
-        if all_tp_refdes:
-            ring_patches = []
-            for tp_r in all_tp_refdes:
-                tp = self._testpoints.get(tp_r)
-                if not tp: continue
-                ring_patches.append(
-                    Circle((tp['x'], tp['y']), self._r(tp) * self._RING_MULT))
-            self._ring_collection = PatchCollection(
-                ring_patches, facecolors='none',
-                edgecolors='#FF2222', linewidths=2.2,
-                zorder=8, alpha=1.0)
-            self.ax.add_collection(self._ring_collection)
-
-        self._redraw_info_table()
+        for idx, (score, kind, key) in enumerate(results[:28]):
+            if y < 0.04:
+                ax.text(0.03, y, '  …', transform=FM, color=self._C_PANEL_MUTE,
+                        fontsize=9, va='top', fontfamily='monospace')
+                break
+            if kind == 'net':
+                tag, tag_col, tag_bg = 'NET ', self._C_TAG_NET, self._C_TAG_NET_BG
+            elif key in self._testpoints:
+                tag, tag_col, tag_bg = 'TP  ', self._C_TAG_TP, self._C_TAG_TP_BG
+            else:
+                tag, tag_col, tag_bg = 'COMP', self._C_TAG_COMP, self._C_TAG_COMP_BG
+            ax.text(0.03, y, f' {tag} ', transform=FM, color=tag_col,
+                    fontsize=9, va='top', fontfamily='monospace', clip_on=True,
+                    fontweight='bold',
+                    bbox=dict(boxstyle='round,pad=0.15', facecolor=tag_bg,
+                              edgecolor='none', alpha=1.0))
+            ax.text(0.22, y, key, transform=FM, color=self._C_PANEL_TEXT,
+                    fontsize=9, va='top', fontfamily='monospace', clip_on=True)
+            self._info_rows.append((y - DY * 0.4, idx, None))
+            y -= DY
 
     def _show_idle_info(self):
         self._clear_info()
         ax = self.ax_info
         ax.text(0.5, 0.60, "PCB Layout Viewer",
-                transform=ax.transAxes, color='#3D5A80',
-                fontsize=13, ha='center', fontweight='bold')
-        ax.text(0.5, 0.53, "Nhap refdes → Find  hoac  Click vao TP",
-                transform=ax.transAxes, color='#2A3A50',
-                fontsize=8.5, ha='center')
-        ax.text(0.5, 0.47, "(vd: U7500  U3100  TPA033  PPA301)",
-                transform=ax.transAxes, color='#22303E',
-                fontsize=8, ha='center', style='italic')
-        ax.text(0.5, 0.38, "Click dong trong bang → highlight TP",
-                transform=ax.transAxes, color='#1E3040',
-                fontsize=7.5, ha='center')
+                transform=ax.transAxes, color=self._C_PANEL_HDR,
+                fontsize=18, ha='center', fontweight='bold')
+        ax.text(0.5, 0.53, "Enter refdes → Find   or   Click on a TP",
+                transform=ax.transAxes, color=self._C_PANEL_TEXT,
+                fontsize=12, ha='center')
+        ax.text(0.5, 0.47, "(e.g. U7500  U3100  TPA033  PPA301)",
+                transform=ax.transAxes, color=self._C_PANEL_SUB,
+                fontsize=11, ha='center', style='italic')
+        ax.text(0.5, 0.38, "Click a row in the table → highlight TP",
+                transform=ax.transAxes, color=self._C_PANEL_SUB,
+                fontsize=11, ha='center')
         n_tp   = len(self._testpoints)
         n_comp = len(self.data['components']) - n_tp
         n_net  = len(self.data['netlist'])
-        for i, t in enumerate([f"{n_comp} linh kien",
+        for i, t in enumerate([f"{n_comp} components",
                                 f"{n_tp} test points",
                                 f"{n_net} nets"]):
             ax.text(0.5, 0.28 - i*0.07, t, transform=ax.transAxes,
-                    color='#3D5A80', fontsize=9, ha='center')
+                    color=self._C_PANEL_HDR, fontsize=13, ha='center')
 
     def _show_info_none(self, query: str):
         self._clear_info()
-        self.ax_info.text(0.5, 0.55, f'Khong tim thay "{query}"',
+        self.ax_info.text(0.5, 0.55, f'Not found: "{query}"',
                           transform=self.ax_info.transAxes,
-                          color='#FC8181', fontsize=10, ha='center')
+                          color='#DC2626', fontsize=14, ha='center')
 
 
 # ─── Entry point ─────────────────────────────────────────────────────────────
