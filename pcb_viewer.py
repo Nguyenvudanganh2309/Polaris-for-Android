@@ -403,8 +403,10 @@ class PCBViewer:
         self.ax_info = self.fig.add_axes([0.645, 0.11, 0.35, 0.875],
                                          facecolor='#FFFFFF')
         self.ax_info.axis('off')
-        self.ax_info.set_frame_on(True)
-        self.ax_info.patch.set_visible(True)
+        self.ax_info.set_xlim(0, 1); self.ax_info.set_ylim(0, 1)
+        self.ax_info.add_patch(mpatches.Rectangle(
+            (0, 0), 1, 1, transform=self.ax_info.transAxes,
+            facecolor=self._C_PANEL_BG, edgecolor='none', zorder=-1))
 
         # ── widgets ──────────────────────────────────────────────────────
         ax_open   = self.fig.add_axes([0.005, 0.952, 0.13,  0.038])
@@ -1579,8 +1581,11 @@ class PCBViewer:
                          current_side: str,
                          highlight_refdes: str = None):
         ax = self.ax_info
-        ax.cla(); ax.axis('off'); ax.set_frame_on(True)
-        ax.patch.set_facecolor(self._C_PANEL_BG); ax.patch.set_visible(True)
+        ax.cla(); ax.axis('off')
+        ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+        ax.add_patch(mpatches.Rectangle(
+            (0, 0), 1, 1, transform=ax.transAxes,
+            facecolor=self._C_PANEL_BG, edgecolor='none', zorder=-1))
         self._info_rows.clear()
         self._no_tp_pin_rows = []
         self._info_mode      = 'net_detail'
@@ -1912,9 +1917,10 @@ class PCBViewer:
     def _clear_info(self):
         self.ax_info.cla()
         self.ax_info.axis('off')
-        self.ax_info.set_frame_on(True)
-        self.ax_info.patch.set_facecolor(self._C_PANEL_BG)
-        self.ax_info.patch.set_visible(True)
+        self.ax_info.set_xlim(0, 1); self.ax_info.set_ylim(0, 1)
+        self.ax_info.add_patch(mpatches.Rectangle(
+            (0, 0), 1, 1, transform=self.ax_info.transAxes,
+            facecolor=self._C_PANEL_BG, edgecolor='none', zorder=-1))
         self._info_rows.clear()
         self._all_info_rows.clear()
         self._info_scroll = 0
@@ -2019,8 +2025,11 @@ class PCBViewer:
     def _redraw_info_table(self):
         """Render the currently visible slice of the info table."""
         ax = self.ax_info
-        ax.cla(); ax.axis('off'); ax.set_frame_on(True)
-        ax.patch.set_facecolor(self._C_PANEL_BG); ax.patch.set_visible(True)
+        ax.cla(); ax.axis('off')
+        ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+        ax.add_patch(mpatches.Rectangle(
+            (0, 0), 1, 1, transform=ax.transAxes,
+            facecolor=self._C_PANEL_BG, edgecolor='none', zorder=-1))
         self._info_rows.clear()
 
         refdes = getattr(self, '_info_comp_refdes', None)
@@ -2126,7 +2135,7 @@ class PCBViewer:
             prev_group = cur_group
 
             has_tp  = tp_r is not None
-            sig_col = self._C_NET_NAME if has_tp else self._C_PANEL_SUB
+            sig_col = self._C_NET_NAME if has_tp else self._C_PANEL_TEXT
             _mc     = self._max_net_chars()
             net_str = net if len(net) <= _mc else net[:_mc - 1] + '\u2026'
 
